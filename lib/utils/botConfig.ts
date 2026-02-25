@@ -51,6 +51,13 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     exitCaptureRate: 0.25,          // 25% capture rate exit
     maxEntryMinute15: 12,           // latest minute-in-15min-window to enter
     minEntryMinute: 2,              // earliest minute to enter
+    ladderStepCents: 2,             // cents inside ask for each sell placement
+    ladderMaxSteps: 6,              // max iterations before going direct
+    ladderTickMs: 2000,             // polling interval in ms
+    ladderTargetDiscount: 5,        // ENTRY: buy when ask drops this many cents from start
+    minPriceEdgeCents: 8,           // grokFifteenMinBot: skip if abs(yes_ask - 50) < this
+    spikeVelocityMultiplier: 2.0,   // OTM wakeup fires at velocity >= threshold × 2.0
+    maxOtmAskCents: 15,             // only show Grok OTM contracts priced ≤ 15¢
   },
 };
 

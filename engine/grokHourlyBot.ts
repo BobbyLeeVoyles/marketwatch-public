@@ -11,6 +11,7 @@
 import { getPrice, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance } from './btcFeed';
 import { getMarketCached, parseTickerSettlementTime, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder, cancelAllOrders } from './kalshiTrader';
+import { runSpreadLadder } from './spreadLadder';
 import { readBotConfig } from '@/lib/utils/botConfig';
 import { logTradeToFile, recordBotOrderId } from './positionTracker';
 import { calculateKalshiFeeBreakdown } from '@/lib/utils/fees';
@@ -104,7 +105,7 @@ function calculateDailyPnL(): { pnl: number; count: number } {
   } catch { return { pnl: 0, count: 0 }; }
 }
 
-async function handleActivePositions(): Promise<void> {
+async function handleActivePositions(arbConfig: ReturnType<typeof readBotConfig>['arb']): Promise<void> {
   if (!botState || botState.positions.length === 0) return;
 
   const legs = [...botState.positions];
@@ -286,21 +287,40 @@ async function handleActivePositions(): Promise<void> {
       if (currentBid <= 0) continue;
 
       try {
-        await placeOrder('grokHourly', leg.ticker, leg.side, 'sell', leg.contracts, currentBid);
+        // Use ladder for Grok exits (direct style — hourly bot has no velocity tracking)
+        const exitResult = await runSpreadLadder({
+          ticker: leg.ticker,
+          side: leg.side,
+          mode: { type: 'exit', sellContracts: leg.contracts },
+          config: arbConfig,
+          exitStyle: 'direct',
+        });
+
+        // Fall back to direct sell if ladder didn't fully close
+        if (exitResult.sellFills < leg.contracts) {
+          const remaining = leg.contracts - exitResult.sellFills;
+          try {
+            await placeOrder('grokHourly', leg.ticker, leg.side, 'sell', remaining, currentBid);
+          } catch { /* best-effort */ }
+        }
+
+        const actualExitPrice = exitResult.finalAskCents > 0 ? exitResult.finalAskCents / 100 : currentBid / 100;
+        const actualBreakdown = calculateKalshiFeeBreakdown(leg.contracts, leg.entryPrice, actualExitPrice, 'early');
+
         logTradeToFile({
           id: leg.orderId || `grokHourly-${Date.now()}`,
           timestamp: leg.entryTime,
           strategy: 'grokHourly',
           direction: leg.side,
           entryPrice: leg.entryPrice,
-          exitPrice: currentBid / 100,
+          exitPrice: actualExitPrice,
           exitType: 'early',
           contracts: leg.contracts,
-          netPnL: breakdown.netPnL,
-          won: breakdown.netPnL > 0,
-          exitReason: 'Grok multi-exit',
+          netPnL: actualBreakdown.netPnL,
+          won: actualBreakdown.netPnL > 0,
+          exitReason: 'Grok multi-exit (ladder)',
         });
-        console.log(`[GROK HOURLY] Grok exit | ${leg.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        console.log(`[GROK HOURLY] Grok exit (ladder) | ${leg.ticker} | P&L: $${actualBreakdown.netPnL.toFixed(2)}`);
         // Remove from surviving legs
         const idx = survivingLegs.findIndex(l => l.ticker === leg.ticker && l.side === leg.side);
         if (idx !== -1) survivingLegs.splice(idx, 1);
@@ -362,7 +382,7 @@ async function grokHourlyBotLoop(): Promise<void> {
 
     // Monitor active positions
     if (botState.positions.length > 0) {
-      await handleActivePositions();
+      await handleActivePositions(config.arb);
     }
 
     // Capital gate (replaces tradedThisHour guard)
@@ -564,25 +584,46 @@ async function grokHourlyBotLoop(): Promise<void> {
       );
 
       try {
-        const response = await placeOrder('grokHourly', bet.ticker, bet.side, 'buy', contracts, askCents);
-        recordBotOrderId(response.order.order_id);
+        const ladderResult = await runSpreadLadder({
+          ticker: bet.ticker,
+          side: bet.side,
+          mode: { type: 'entry', buyContracts: contracts },
+          config: config.arb,
+          minutesRemaining,
+        });
 
+        if (ladderResult.status === 'accidental-fill') {
+          console.warn(`[GROK HOURLY] Accidental fill during ladder for ${bet.ticker} — closing at market`);
+          try {
+            await placeOrder('grokHourly', bet.ticker, bet.side, 'buy', 1, ladderResult.finalAskCents);
+          } catch { /* best-effort */ }
+          continue;
+        }
+
+        if (!ladderResult.buyPlaced) {
+          console.log(`[GROK HOURLY] Ladder entry did not place buy for ${bet.ticker} (status: ${ladderResult.status})`);
+          continue;
+        }
+
+        if (ladderResult.buyOrderId) recordBotOrderId(ladderResult.buyOrderId);
+
+        const actualEntryPriceDollars = ladderResult.buyPriceCents / 100;
         const position: BotPosition = {
           bot: 'grokHourly',
           ticker: bet.ticker,
           side: bet.side,
           contracts,
-          entryPrice: entryPriceDollars,
-          totalCost: contracts * entryPriceDollars,
+          entryPrice: actualEntryPriceDollars,
+          totalCost: contracts * actualEntryPriceDollars,
           entryTime: new Date().toISOString(),
           btcPriceAtEntry: btcPrice,
           strike: market.strike,
-          orderId: response.order.order_id,
+          orderId: ladderResult.buyOrderId,
           fills: [],
         };
 
         botState.positions.push(position);
-        botState.capitalDeployedThisHour += contracts * entryPriceDollars;
+        botState.capitalDeployedThisHour += contracts * actualEntryPriceDollars;
         botState.lastExitCheck = Date.now();
 
         // Persist after each successful order
@@ -590,7 +631,12 @@ async function grokHourlyBotLoop(): Promise<void> {
         allPos.grokHourly = botState.positions;
         writeBotPositions(allPos);
 
-        console.log(`[GROK HOURLY] Order placed | ${bet.ticker} | ID: ${response.order.order_id} | Capital deployed: $${botState.capitalDeployedThisHour.toFixed(2)}`);
+        const saving = askCents - ladderResult.buyPriceCents;
+        console.log(
+          `[GROK HOURLY] Ladder entry | ${bet.ticker} | ID: ${ladderResult.buyOrderId ?? 'n/a'} | ` +
+          `${ladderResult.buyPriceCents}¢ (saved ${saving >= 0 ? saving : 0}¢) | ` +
+          `Capital deployed: $${botState.capitalDeployedThisHour.toFixed(2)}`
+        );
       } catch (err) {
         botState.lastError = err instanceof Error ? err.message : String(err);
         console.error(`[GROK HOURLY] Order failed for ${bet.ticker}:`, err);

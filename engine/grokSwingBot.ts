@@ -17,13 +17,13 @@
  * (replaces startArbScanner / stopArbScanner / getArbScannerStatus)
  */
 
-import { randomUUID } from 'crypto';
 import { getKalshiClient } from '@/lib/kalshi/client';
 import { getPrice } from './btcFeed';
 import { readBotConfig } from '@/lib/utils/botConfig';
 import { logTradeToFile, openTradeLifecycle, closeTradeLifecycle } from './positionTracker';
 import { getMarketCached, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder } from './kalshiTrader';
+import { runSpreadLadder } from './spreadLadder';
 import { getGrokSwingEntry, getGrokMultiExitCheck } from '@/lib/ai/grokClient';
 import { buildSwingEntryPrompt, buildMultiExitPrompt } from '@/lib/ai/grokPrompts';
 import { calculateKalshiFeeBreakdown } from '@/lib/utils/fees';
@@ -36,8 +36,6 @@ import * as path from 'path';
 const LOOP_INTERVAL_MS = 3_000;            // 3-second main loop
 const SIGNAL_WAKEUP_COOLDOWN_MS = 90_000;  // min 90s between Grok wakeup calls
 const EXIT_CHECK_INTERVAL_MS = 3 * 60_000; // Grok exit check every 3 minutes
-const PENDING_ENTRY_TTL_MS = 60_000;       // pending entry expires after 60s
-const BTC_DRIFT_THRESHOLD = 0.003;         // 0.3% drift cancels pending entry
 const BOT_POSITIONS_FILE = path.resolve('./data/bot-positions.json');
 
 // ── Math helpers (copied from strikeSniper) ───────────────────────────────────
@@ -116,37 +114,6 @@ function calculateDailyPnL(): { pnl: number; count: number } {
   }
 }
 
-// ── IOC limit order (copied from strikeSniper) ────────────────────────────────
-
-async function placeIOCLimitOrder(
-  ticker: string,
-  side: 'yes' | 'no',
-  contracts: number,
-  priceCents: number,
-): Promise<{ orderId: string; status: string } | null> {
-  const client = getKalshiClient();
-  try {
-    const response = await client.placeOrder({
-      ticker,
-      action: 'buy',
-      side,
-      type: 'limit',
-      count: contracts,
-      yes_price: side === 'yes' ? priceCents : undefined,
-      no_price: side === 'no' ? priceCents : undefined,
-      client_order_id: randomUUID(),
-      time_in_force: 'immediate_or_cancel',
-    });
-    return {
-      orderId: response.order.order_id,
-      status: response.order.status,
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[SWING] IOC order failed: ${msg}`);
-    return null;
-  }
-}
 
 // ── State ──────────────────────────────────────────────────────────────────────
 
@@ -170,17 +137,6 @@ interface GrokSwingBotState {
   btcPriceHistory: Array<{ price: number; ts: number }>;
   lastSignalWakeupTime: number;  // cooldown: min 90s between wakeups
   lastGrokExitCheckTime: number; // normal 3-min exit check cycle
-
-  // Pending entry (IOC missed → watch for fill opportunity)
-  pendingEntry?: {
-    windowType: '15min' | 'hourly';
-    side: 'yes' | 'no';
-    ticker: string;
-    contracts: number;
-    limitPriceCents: number;     // original ask (re-check against this)
-    btcPriceAtDecision: number;
-    expiresAt: number;           // Date.now() + PENDING_ENTRY_TTL_MS
-  };
 
   dailyPnL: number;
   tradesCount: number;
@@ -350,6 +306,17 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
     }
   }
 
+  // Compute current velocity for exit style decision
+  const nowTs2 = Date.now();
+  const cutoff60 = nowTs2 - 60_000;
+  const window60s = botState.btcPriceHistory.filter(h => h.ts >= cutoff60);
+  const currentVelocity = window60s.length >= 2
+    ? (window60s[window60s.length - 1].price - window60s[0].price) /
+      ((window60s[window60s.length - 1].ts - window60s[0].ts) / 60_000)
+    : 0;
+  const exitStyle: 'direct' | 'ladder' =
+    Math.abs(currentVelocity) > arbConfig.velocityThresholdPerMin * 0.5 ? 'direct' : 'ladder';
+
   // Grok multi-exit check every 3 minutes
   const now = Date.now();
   if (forGrokCheck.length > 0 && (now - botState.lastGrokExitCheckTime) >= EXIT_CHECK_INTERVAL_MS) {
@@ -384,7 +351,24 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
       const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPrice, currentBid / 100, 'early');
 
       try {
-        await placeOrder('arb', pos.ticker, pos.side, 'sell', pos.contracts, currentBid);
+        const exitResult = await runSpreadLadder({
+          ticker: pos.ticker,
+          side: pos.side,
+          mode: { type: 'exit', sellContracts: pos.contracts },
+          config: arbConfig,
+          exitStyle,
+        });
+
+        // Fall back to direct sell if ladder didn't fully close
+        if (exitResult.sellFills < pos.contracts) {
+          const remaining = pos.contracts - exitResult.sellFills;
+          try {
+            await placeOrder('arb', pos.ticker, pos.side, 'sell', remaining, currentBid);
+          } catch { /* best-effort */ }
+        }
+
+        const actualExitPrice = exitResult.finalAskCents > 0 ? exitResult.finalAskCents / 100 : currentBid / 100;
+        const actualBreakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPrice, actualExitPrice, 'early');
 
         logTradeToFile({
           id: pos.orderId || `arb-${Date.now()}`,
@@ -393,12 +377,12 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
           direction: pos.side,
           strike: pos.strike,
           entryPrice: pos.entryPrice,
-          exitPrice: currentBid / 100,
+          exitPrice: actualExitPrice,
           exitType: 'early',
           contracts: pos.contracts,
-          netPnL: breakdown.netPnL,
-          won: breakdown.netPnL > 0,
-          exitReason: '[SWING] Grok multi-exit',
+          netPnL: actualBreakdown.netPnL,
+          won: actualBreakdown.netPnL > 0,
+          exitReason: `[SWING] Grok multi-exit (ladder:${exitStyle})`,
         });
 
         if (pos.orderId) {
@@ -407,13 +391,13 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
             exitTime: new Date().toISOString(),
             exitBtcPrice: btcPrice,
             exitType: 'early',
-            exitPrice: currentBid / 100,
-            finalPnL: breakdown.netPnL,
-            won: breakdown.netPnL > 0,
+            exitPrice: actualExitPrice,
+            finalPnL: actualBreakdown.netPnL,
+            won: actualBreakdown.netPnL > 0,
           });
         }
 
-        console.log(`[SWING] Grok exit | ${pos.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        console.log(`[SWING] Grok exit (ladder:${exitStyle}) | ${pos.ticker} | P&L: $${actualBreakdown.netPnL.toFixed(2)}`);
 
         // Remove from surviving
         const idx = surviving.findIndex(s => s.posKey === posKey);
@@ -442,79 +426,6 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
   writeBotPositions(allPositions);
 }
 
-// ── Pending entry retry ────────────────────────────────────────────────────────
-
-async function handlePendingEntry(btcPrice: number): Promise<void> {
-  if (!botState?.pendingEntry) return;
-
-  const p = botState.pendingEntry;
-
-  // Check expiry
-  if (Date.now() > p.expiresAt) {
-    botState.pendingEntry = undefined;
-    console.log('[SWING] Pending entry discarded: expired');
-    return;
-  }
-
-  // Check BTC drift
-  const drift = Math.abs(btcPrice - p.btcPriceAtDecision) / p.btcPriceAtDecision;
-  if (drift > BTC_DRIFT_THRESHOLD) {
-    botState.pendingEntry = undefined;
-    console.log(`[SWING] Pending entry discarded: BTC drift ${(drift * 100).toFixed(2)}%`);
-    return;
-  }
-
-  // Fetch fresh ask
-  let freshAsk: number;
-  try {
-    const market = await getMarketCached(p.ticker);
-    freshAsk = p.side === 'yes' ? market.yes_ask : market.no_ask;
-  } catch {
-    return; // skip this tick, try again next
-  }
-
-  if (freshAsk <= 0 || freshAsk > p.limitPriceCents + 1) {
-    return; // ask still too high — keep waiting
-  }
-
-  // Ask is now in range — market buy at ask
-  const result = await placeIOCLimitOrder(p.ticker, p.side, p.contracts, freshAsk);
-  if (!result) return;
-
-  const filled = result.status !== 'canceled' && result.status !== 'cancelled';
-  if (!filled) return; // still not filled, keep waiting
-
-  // Record position
-  const posKey = p.windowType === 'hourly' ? 'arb-hourly' : 'arb';
-  const position: BotPosition = {
-    bot: 'arb',
-    ticker: p.ticker,
-    side: p.side,
-    contracts: p.contracts,
-    entryPrice: freshAsk / 100,
-    totalCost: p.contracts * (freshAsk / 100),
-    entryTime: new Date().toISOString(),
-    btcPriceAtEntry: btcPrice,
-    orderId: result.orderId,
-    fills: [],
-    signalName: 'SWING PENDING FILL',
-  };
-
-  if (p.windowType === 'hourly') {
-    botState.hourlyPosition = position;
-    botState.tradedThisHourlyWindow = true;
-  } else {
-    botState.fifteenMinPosition = position;
-    botState.tradedThisWindow = true;
-  }
-
-  const allPositions = readBotPositions();
-  allPositions[posKey] = position;
-  writeBotPositions(allPositions);
-
-  botState.pendingEntry = undefined;
-  console.log(`[SWING] Pending entry filled | ${p.ticker} ${p.side.toUpperCase()} @ ${freshAsk}¢ × ${p.contracts} | Order: ${result.orderId}`);
-}
 
 // ── Grok swing wakeup ──────────────────────────────────────────────────────────
 
@@ -524,23 +435,23 @@ async function grokSwingWakeup(
   velocity: number,
   atmBtcPrice: number,
   arbConfig: ReturnType<typeof readBotConfig>['arb'],
+  otmMode = false,
 ): Promise<void> {
   if (!botState) return;
 
   const atmDistance = Math.abs(btcPrice - atmBtcPrice);
   const velocityDirection = velocity > 0 ? 'up' : 'down';
+  const spikeDirection = velocityDirection;
 
   console.log(
-    `[SWING] Grok wakeup | ${windowType} | ` +
+    `[SWING] ${otmMode ? 'OTM spike' : 'Grok'} wakeup | ${windowType} | ` +
     `vel=${velocity >= 0 ? '+' : ''}${velocity.toFixed(0)}$/min | ` +
-    `ATM dist=$${atmDistance.toFixed(0)} | BTC $${btcPrice.toFixed(0)}`
+    `${otmMode ? 'drift' : 'ATM dist'}=$${atmDistance.toFixed(0)} | BTC $${btcPrice.toFixed(0)}`
   );
 
-  // Fetch ATM-adjacent markets
   const client = getKalshiClient();
   const series = windowType === 'hourly' ? 'KXBTCD' : 'KXBTC15M';
   const now = Date.now();
-  const ATM_RANGE_DOLLARS = 1000; // show strikes within $1000 of BTC
 
   let rawMarkets: Awaited<ReturnType<typeof client.getMarkets>>;
   try {
@@ -550,12 +461,31 @@ async function grokSwingWakeup(
     return;
   }
 
+  // OTM spike: filter contracts $800–$1250 OTM in the spike direction, ask ≤ maxOtmAskCents
+  // ATM swing:  filter contracts within $1000 of BTC (both directions)
+  const OTM_MIN = 800;
+  const OTM_MAX = 1250;
+  const maxOtmAsk = arbConfig.maxOtmAskCents ?? 15;
+
   const strikeMarkets = rawMarkets
     .filter(m => {
       const strike = parseStrikeFromTicker(m.ticker);
       if (!strike) return false;
       const close = new Date(m.close_time).getTime();
-      return close > now && Math.abs(strike - btcPrice) <= ATM_RANGE_DOLLARS;
+      if (close <= now) return false;
+
+      if (otmMode) {
+        const dist = strike - btcPrice;
+        if (spikeDirection === 'up') {
+          // YES on higher strikes: $800–$1250 above BTC and ask ≤ maxOtmAsk
+          return dist >= OTM_MIN && dist <= OTM_MAX && m.yes_ask > 0 && m.yes_ask <= maxOtmAsk;
+        } else {
+          // NO on lower strikes: $800–$1250 below BTC and ask ≤ maxOtmAsk
+          return (-dist) >= OTM_MIN && (-dist) <= OTM_MAX && m.no_ask > 0 && m.no_ask <= maxOtmAsk;
+        }
+      } else {
+        return Math.abs(strike - btcPrice) <= 1000;
+      }
     })
     .map(m => ({
       market: m,
@@ -564,21 +494,20 @@ async function grokSwingWakeup(
     .sort((a, b) => a.strike - b.strike);
 
   if (strikeMarkets.length === 0) {
-    console.warn(`[SWING] No ATM-adjacent ${series} markets found`);
+    console.log(`[SWING] No ${otmMode ? 'OTM spike candidates' : 'ATM-adjacent markets'} found for ${series}`);
     return;
   }
 
-  // Pick the closest market to ATM for minutes-remaining reference
-  const atmMarket = strikeMarkets.reduce((best, m) =>
-    Math.abs(m.strike - btcPrice) < Math.abs(best.strike - btcPrice) ? m : best
-  );
-  const minsRemaining = Math.max(0, (new Date(atmMarket.market.close_time).getTime() - now) / 60_000);
+  // Use first available market for minsRemaining (all hourly markets close at the same time)
+  const refMarket = otmMode
+    ? strikeMarkets[0]
+    : strikeMarkets.reduce((best, m) =>
+        Math.abs(m.strike - btcPrice) < Math.abs(best.strike - btcPrice) ? m : best
+      );
+  const minsRemaining = Math.max(0, (new Date(refMarket.market.close_time).getTime() - now) / 60_000);
 
-  // σ $/√min → approx. fraction per √min at current BTC price
-  // hourly: ~0.5% BTC move per hour → σ = 0.005 * btcPrice / sqrt(60)
-  // 15-min: ~0.3% BTC move per 15min → σ = 0.003 * btcPrice / sqrt(15)
   const roughSigmaFrac = windowType === 'hourly' ? 0.005 / Math.sqrt(60) : 0.003 / Math.sqrt(15);
-  const roughSigma = roughSigmaFrac; // dimensionless fraction; estimateFairYes uses log-normal
+  const roughSigma = roughSigmaFrac;
 
   const strikesForPrompt = strikeMarkets.slice(0, 8).map(({ market, strike }) => ({
     ticker: market.ticker,
@@ -588,7 +517,6 @@ async function grokSwingWakeup(
     fairYesPct: estimateFairYes(btcPrice, strike, roughSigma, minsRemaining) * 100,
   }));
 
-  // Build prompt and call Grok
   const prompt = buildSwingEntryPrompt({
     utcTime: new Date().toISOString(),
     btcPrice,
@@ -599,9 +527,11 @@ async function grokSwingWakeup(
     minutesRemaining: minsRemaining,
     windowType,
     strikes: strikesForPrompt,
+    otmMode,
+    capitalPerTrade: arbConfig.capitalPerTrade,
   });
 
-  const decision = await getGrokSwingEntry(prompt, 'grokSwing');
+  const decision = await getGrokSwingEntry(prompt, otmMode ? 'grokSpikeOtm' : 'grokSwing');
 
   console.log(
     `[SWING] Grok: ${decision.action}` +
@@ -622,93 +552,98 @@ async function grokSwingWakeup(
     return;
   }
 
-  // Fetch fresh ask
+  // Validate ask price (OTM mode uses maxOtmAskCents ceiling; ATM uses maxEntryPriceCents)
   const freshAskCents = decision.side === 'yes' ? chosenStrike.yesAsk : chosenStrike.noAsk;
-  if (freshAskCents <= 0 || freshAskCents > arbConfig.maxEntryPriceCents) {
-    console.log(`[SWING] Ask ${freshAskCents}¢ out of range (max ${arbConfig.maxEntryPriceCents}¢) — skip`);
+  const maxAsk = otmMode ? (arbConfig.maxOtmAskCents ?? 15) : arbConfig.maxEntryPriceCents;
+  if (freshAskCents <= 0 || freshAskCents > maxAsk) {
+    console.log(`[SWING] Ask ${freshAskCents}¢ out of range (max ${maxAsk}¢) — skip`);
     return;
   }
 
-  const limitPriceCents = Math.max(1, freshAskCents - arbConfig.limitDiscountCents);
   const contracts = Math.floor(arbConfig.capitalPerTrade / (freshAskCents / 100));
   if (contracts < 1) {
     console.log(`[SWING] Insufficient capital ($${arbConfig.capitalPerTrade}) at ${freshAskCents}¢ — skip`);
     return;
   }
 
-  // Place IOC limit order
-  const result = await placeIOCLimitOrder(decision.ticker, decision.side, contracts, limitPriceCents);
-  if (!result) return;
+  const signalName = otmMode
+    ? `SWING OTM spike: ${decision.side.toUpperCase()} vel=${velocity.toFixed(0)}$/min drift=$${atmDistance.toFixed(0)}`
+    : `SWING ${windowType}: ${decision.side.toUpperCase()} vel=${velocity.toFixed(0)}$/min`;
 
-  const filled = result.status !== 'canceled' && result.status !== 'cancelled';
-  const signalName = `SWING ${windowType}: ${decision.side.toUpperCase()} vel=${velocity.toFixed(0)}$/min`;
+  // Run spread ladder — compresses ask via MM penny dynamic, then buys
+  const ladderResult = await runSpreadLadder({
+    ticker: decision.ticker,
+    side: decision.side,
+    mode: { type: 'entry', buyContracts: contracts },
+    config: arbConfig,
+    minutesRemaining: minsRemaining,
+  });
 
-  if (filled) {
-    // Record position immediately
-    const posKey = windowType === 'hourly' ? 'arb-hourly' : 'arb';
-    const position: BotPosition = {
-      bot: 'arb',
-      ticker: decision.ticker,
-      side: decision.side,
-      contracts,
-      entryPrice: limitPriceCents / 100,
-      totalCost: contracts * (limitPriceCents / 100),
-      entryTime: new Date().toISOString(),
-      btcPriceAtEntry: btcPrice,
-      strike: chosenStrike.strike,
-      orderId: result.orderId,
-      fills: [],
-      signalName,
-    };
+  if (ladderResult.status === 'accidental-fill') {
+    // A real buyer hit our ladder sell — we now hold an unintended NO position.
+    // Close it at market (best-effort) and abort this entry.
+    console.warn(`[SWING] Accidental fill during ladder — closing NO position at market`);
+    try {
+      await placeOrder('arb', decision.ticker, decision.side, 'buy', 1, ladderResult.finalAskCents);
+    } catch { /* best-effort */ }
+    return;
+  }
 
-    if (windowType === 'hourly') {
-      botState.hourlyPosition = position;
-      botState.tradedThisHourlyWindow = true;
-    } else {
-      botState.fifteenMinPosition = position;
-      botState.tradedThisWindow = true;
-    }
+  if (!ladderResult.buyPlaced) {
+    console.log(`[SWING] Ladder entry did not place buy (status: ${ladderResult.status}) — skipping`);
+    return;
+  }
 
-    const allPositions = readBotPositions();
-    allPositions[posKey] = position;
-    writeBotPositions(allPositions);
+  // Record position
+  const posKey = windowType === 'hourly' ? 'arb-hourly' : 'arb';
+  const entryPriceCents = ladderResult.buyPriceCents;
+  const position: BotPosition = {
+    bot: 'arb',
+    ticker: decision.ticker,
+    side: decision.side,
+    contracts,
+    entryPrice: entryPriceCents / 100,
+    totalCost: contracts * (entryPriceCents / 100),
+    entryTime: new Date().toISOString(),
+    btcPriceAtEntry: btcPrice,
+    strike: chosenStrike.strike,
+    orderId: ladderResult.buyOrderId,
+    fills: [],
+    signalName,
+  };
 
+  if (windowType === 'hourly') {
+    botState.hourlyPosition = position;
+    botState.tradedThisHourlyWindow = true;
+  } else {
+    botState.fifteenMinPosition = position;
+    botState.tradedThisWindow = true;
+  }
+
+  const allPositions = readBotPositions();
+  allPositions[posKey] = position;
+  writeBotPositions(allPositions);
+
+  if (ladderResult.buyOrderId) {
     openTradeLifecycle({
-      tradeId: result.orderId,
+      tradeId: ladderResult.buyOrderId,
       bot: 'arb',
       ticker: decision.ticker,
       side: decision.side,
       contracts,
-      entryPrice: limitPriceCents / 100,
+      entryPrice: entryPriceCents / 100,
       entryTime: position.entryTime,
       entryBtcPrice: btcPrice,
       signal: signalName,
     });
-
-    console.log(
-      `[SWING] ENTRY FILLED | ${windowType} ${decision.side.toUpperCase()} | ` +
-      `${decision.ticker} | ${limitPriceCents}¢ × ${contracts} = $${position.totalCost.toFixed(2)} | ` +
-      `Order: ${result.orderId} (${result.status})`
-    );
-
-  } else {
-    // IOC missed — store as pending entry for re-attempt
-    botState.pendingEntry = {
-      windowType,
-      side: decision.side,
-      ticker: decision.ticker,
-      contracts,
-      limitPriceCents: freshAskCents,  // re-check against original ask
-      btcPriceAtDecision: btcPrice,
-      expiresAt: Date.now() + PENDING_ENTRY_TTL_MS,
-    };
-
-    console.log(
-      `[SWING] IOC missed → pendingEntry | ` +
-      `${decision.ticker} ${decision.side.toUpperCase()} @ ${freshAskCents}¢ | ` +
-      `expires in ${PENDING_ENTRY_TTL_MS / 1000}s`
-    );
   }
+
+  const saving = freshAskCents - entryPriceCents;
+  console.log(
+    `[SWING] LADDER ENTRY | ${windowType} ${decision.side.toUpperCase()} | ` +
+    `${decision.ticker} | ${entryPriceCents}¢ × ${contracts} = $${position.totalCost.toFixed(2)} | ` +
+    `Saved: ${saving >= 0 ? saving : 0}¢/contract vs ask | Order: ${ladderResult.buyOrderId ?? 'n/a'}`
+  );
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────────
@@ -792,13 +727,6 @@ async function swingBotLoop(): Promise<void> {
       await handleActivePositions(btcPrice, arbConfig);
     }
 
-    // ── Handle pending entry ─────────────────────────────────────────────────
-
-    if (botState.pendingEntry) {
-      await handlePendingEntry(btcPrice);
-      return; // don't fire new signals while a pending entry exists
-    }
-
     // ── Signal detection ─────────────────────────────────────────────────────
 
     const cutoff60 = nowTs - 60_000;
@@ -841,6 +769,23 @@ async function swingBotLoop(): Promise<void> {
       botState.lastSignalWakeupTime = Date.now();
       botState.lastSignalDetail = `1h vel=${velocity.toFixed(0)}$/min ATM@${botState.hourlyWindowOpenBtcPrice.toFixed(0)}`;
       await grokSwingWakeup('hourly', btcPrice, velocity, botState.hourlyWindowOpenBtcPrice, arbConfig);
+    }
+
+    // OTM spike hunter: fires during high-velocity moves regardless of ATM proximity
+    // Looks for cheap contracts ($800–$1250 OTM in spike direction, ask ≤ maxOtmAskCents)
+    const spikeVelOk = Math.abs(velocity) >= arbConfig.velocityThresholdPerMin * (arbConfig.spikeVelocityMultiplier ?? 2.0);
+    if (
+      spikeVelOk &&
+      !botState.tradedThisHourlyWindow &&
+      !botState.hourlyPosition &&
+      minuteInHour >= arbConfig.minEntryMinute &&
+      minuteInHour <= 50 &&
+      Date.now() - botState.lastSignalWakeupTime >= SIGNAL_WAKEUP_COOLDOWN_MS
+    ) {
+      botState.lastSignalWakeupTime = Date.now();
+      const hourlyDrift = btcPrice - botState.hourlyWindowOpenBtcPrice;
+      botState.lastSignalDetail = `1h OTM spike vel=${velocity.toFixed(0)}$/min drift=${hourlyDrift >= 0 ? '+' : ''}$${hourlyDrift.toFixed(0)}`;
+      await grokSwingWakeup('hourly', btcPrice, velocity, botState.hourlyWindowOpenBtcPrice, arbConfig, true);
     }
 
   } catch (err) {
@@ -930,13 +875,5 @@ export function getGrokSwingBotStatus() {
     hasHourlyPosition: botState.hourlyPosition !== null,
     lastSignalDetail: botState.lastSignalDetail,
     lastError: botState.lastError,
-    pendingEntry: botState.pendingEntry
-      ? {
-          windowType: botState.pendingEntry.windowType,
-          side: botState.pendingEntry.side,
-          ticker: botState.pendingEntry.ticker,
-          expiresIn: Math.max(0, botState.pendingEntry.expiresAt - Date.now()),
-        }
-      : undefined,
   };
 }

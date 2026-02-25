@@ -318,8 +318,24 @@ export function analyzeExit(
 
   // ──── ITM / CONSERVATIVE EXIT LOGIC (entry > 50¢) ────
 
-  // PRIORITY 1: CRITICAL RISK - Exit immediately
+  // PRIORITY 1: CRITICAL RISK - Exit immediately, unless time permits recovery.
+  // lossRisk 50-75% with >20m remaining = BTC dipped below strike but can recover;
+  // hold rather than panic-exit. Only force-exit when deeply underwater (≥75%)
+  // or running out of time (≤20m).
   if (dirRiskLevel === 'critical') {
+    if (minutesRemaining > 20 && lossRisk < 0.75) {
+      return {
+        shouldExit: false,
+        reason: `Critical risk (${(lossRisk * 100).toFixed(0)}%) but ${Math.round(minutesRemaining)}m remain — holding for recovery`,
+        expectedNetPnL: settlementExpectedNet,
+        currentValue: currentImpliedPrice,
+        settlementExpectedValue: winProbability,
+        feeImpact: 0,
+        confidence: 'medium',
+        riskOfRuin: lossRisk,
+        riskLevel: 'critical',
+      };
+    }
     return {
       shouldExit: true,
       reason: `CRITICAL: ${riskAnalysis.reason}. Exit to preserve capital.`,

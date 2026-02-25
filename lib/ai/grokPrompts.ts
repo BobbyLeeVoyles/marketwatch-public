@@ -188,6 +188,7 @@ export interface BuildHourlyPromptParams {
     entryPrice: number;           // dollars
     unrealizedPnL: number;
   }>;
+  orderBookDepth?: string;        // e.g. "bids: 43¢×5, 42¢×12 | thin zone: 44–46¢"
 }
 
 export function buildHourlyPrompt(p: BuildHourlyPromptParams): string {
@@ -232,7 +233,7 @@ ${openPositionsStr}
 ── MARKET MICROSTRUCTURE ──
 Funding rate: ${fundingStr}
   [For 60-minute exposure, funding rate carries more weight than 15-min trades]
-BTC order book imbalance (top 20 levels): ${obiStr}
+BTC order book imbalance (top 20 levels): ${obiStr}${p.orderBookDepth ? `\nKalshi order book depth: ${p.orderBookDepth}\n  [thin zone = safe for ladder sells; deep bid zone = real buyers present]` : ''}
 
 ── HOURLY PRICE ACTION (last 10 candles, oldest → newest) ──
 ${formatHourlyTable(p.hourlyCandles)}
@@ -391,9 +392,59 @@ export interface BuildSwingEntryPromptParams {
     noAsk: number;      // cents
     fairYesPct: number; // 0–100 from estimateFairYes
   }>;
+  orderBookDepth?: string;    // e.g. "bids: 43¢×5, 42¢×12 | thin zone: 44–46¢"
+  otmMode?: boolean;          // true = OTM spike hunter: cheap contracts in spike direction
+  capitalPerTrade?: number;   // used in OTM mode to show reward calc to Grok
 }
 
 export function buildSwingEntryPrompt(p: BuildSwingEntryPromptParams): string {
+  // ── OTM spike mode: completely different framing ───────────────────────────
+  if (p.otmMode) {
+    const spikeDir = p.velocityDirection;
+    const targetSide = spikeDir === 'up' ? 'YES' : 'NO';
+    const capital = p.capitalPerTrade ?? 3;
+    const candidateRows = p.strikes
+      .sort((a, b) => a.strike - b.strike)
+      .map(s => {
+        const askCents = spikeDir === 'up' ? s.yesAsk : s.noAsk;
+        const otherCents = spikeDir === 'up' ? s.noAsk : s.yesAsk;
+        const dist = Math.abs(s.strike - p.btcPrice);
+        const contracts = askCents > 0 ? Math.floor((capital / (askCents / 100))) : 0;
+        const grossWin = contracts * (1 - askCents / 100);
+        return (
+          `  ${s.ticker}  $${s.strike.toLocaleString()}  (${dist >= 0 ? '+' : ''}$${dist.toFixed(0)} OTM)\n` +
+          `    ${targetSide} ask: ${askCents}¢  |  ${targetSide === 'YES' ? 'NO' : 'YES'} ask: ${otherCents}¢  |  ${contracts} contracts @ $${capital} capital → gross win $${grossWin.toFixed(2)}`
+        );
+      })
+      .join('\n');
+
+    return `You are trading BTC binary contracts on Kalshi. A high-velocity BTC spike is in progress.
+
+UTC time: ${p.utcTime}
+Window: ${p.windowType} | ${p.minutesRemaining.toFixed(1)} minutes remaining
+BTC spot: $${p.btcPrice.toFixed(2)}
+BTC velocity: ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min (${p.velocityDirection} spike)
+Hour-open BTC: $${p.atmBtcPrice.toFixed(0)} | Drift from open: $${p.atmDistance.toFixed(0)} ${p.velocityDirection}
+
+Strategy: These cheap OTM ${targetSide} contracts are $1,000–$1,250 away from current BTC and priced under 15¢. If this spike has momentum, BTC could reach (or approach) these strikes within ${p.minutesRemaining.toFixed(0)} minutes. The asymmetric payoff (10¢ → 90¢) makes a small position worth taking even at modest probability.
+
+── OTM SPIKE CANDIDATES (${targetSide} contracts in spike direction) ──
+${candidateRows}
+
+Decision criteria:
+• ENTER if you believe the spike has real momentum and BTC could approach the strike before settlement
+• Choose the closest OTM strike (highest probability) unless there's a strong reason to go further
+• SKIP if velocity looks like a wick/reversal rather than sustained momentum, or time is too short
+• SKIP if ${p.minutesRemaining.toFixed(0)} minutes is insufficient for BTC to move that far at current pace
+• For ${spikeDir.toUpperCase()} spike: choose ${targetSide} side only
+
+Respond ONLY with valid JSON — no markdown, no extra text:
+{"action":"ENTER","side":"${spikeDir === 'up' ? 'yes' : 'no'}","ticker":"<exact ticker from above>","reason":"<20 words max>"}
+or
+{"action":"SKIP","side":"","ticker":"","reason":"<20 words max>"}`;
+  }
+
+  // ── ATM swing mode: original logic ────────────────────────────────────────
   const strikeRows = p.strikes
     .sort((a, b) => a.strike - b.strike)
     .map(s => {
@@ -415,6 +466,10 @@ export function buildSwingEntryPrompt(p: BuildSwingEntryPromptParams): string {
     ? `BTC is rising at ${p.velocity.toFixed(0)} $/min — YES contracts may have been bid ahead of BTC`
     : `BTC is falling at ${Math.abs(p.velocity).toFixed(0)} $/min — NO contracts may have been bid ahead of BTC`;
 
+  const depthSection = p.orderBookDepth
+    ? `\n── KALSHI ORDER BOOK DEPTH ──\n${p.orderBookDepth}\n  [thin zone = safe for ladder sells; deep bid zone = real buyers present, avoid]\n`
+    : '';
+
   return `You are trading BTC binary contracts on Kalshi. Momentum traders have pushed option prices ahead of BTC's actual position — there may be a swing entry here.
 
 Strategy: Buy the contract that is priced cheaply relative to its fair value given BTC's velocity. Exit rule-based at 25% capture rate — you don't need to predict settlement, just an early price reversion.
@@ -426,7 +481,7 @@ BTC velocity: ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min (${p.v
 ATM reference (window-open price): $${p.atmBtcPrice.toFixed(0)} | Distance from ATM: $${p.atmDistance.toFixed(0)}
 
 Momentum context: ${momentumDesc}
-
+${depthSection}
 ── STRIKES (sorted low → high, with edge vs fair value) ──
 [edge < 0 = contract cheaper than fair → potential buy; edge > 0 = overpriced → skip]
 ${strikeRows}

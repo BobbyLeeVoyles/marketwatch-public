@@ -9,6 +9,7 @@
 import { getPrice, fetch1MinCandles, fetch5MinCandles, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance } from './btcFeed';
 import { find15MinMarket, getMarketCached, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder, cancelAllOrders } from './kalshiTrader';
+import { runSpreadLadder } from './spreadLadder';
 import { readBotConfig } from '@/lib/utils/botConfig';
 import { logTradeToFile, recordBotOrderId } from './positionTracker';
 import { calculateKalshiFeeBreakdown } from '@/lib/utils/fees';
@@ -477,6 +478,15 @@ async function grokFifteenMinBotLoop(): Promise<void> {
       return;
     }
 
+    // minPriceEdgeCents: skip when both sides are near 50¢ (market open, low edge)
+    const arbConfig = config.arb;
+    if (Math.abs(market.yes_ask - 50) < arbConfig.minPriceEdgeCents) {
+      console.log(
+        `[GROK 15MIN] Price edge too low (yes_ask=${market.yes_ask}¢, threshold=${arbConfig.minPriceEdgeCents}¢) — skipping`
+      );
+      return;
+    }
+
     const entryPriceDollars = askCents / 100;
     const contracts = Math.floor(botConfig.capitalPerTrade / entryPriceDollars);
     if (contracts < 1) {
@@ -493,19 +503,42 @@ async function grokFifteenMinBotLoop(): Promise<void> {
     );
 
     try {
-      const response = await placeOrder('grok15min', market.ticker, side, 'buy', contracts, askCents);
-      recordBotOrderId(response.order.order_id);
+      const ladderResult = await runSpreadLadder({
+        ticker: market.ticker,
+        side,
+        mode: { type: 'entry', buyContracts: contracts },
+        config: arbConfig,
+        minutesRemaining: minsRemaining,
+      });
 
+      if (ladderResult.status === 'accidental-fill') {
+        console.warn('[GROK 15MIN] Accidental fill during ladder — closing at market');
+        try {
+          await placeOrder('grok15min', market.ticker, side, 'buy', 1, ladderResult.finalAskCents);
+        } catch { /* best-effort */ }
+        botState.tradedThisWindow = true;
+        return;
+      }
+
+      if (!ladderResult.buyPlaced) {
+        console.log(`[GROK 15MIN] Ladder entry did not place buy (status: ${ladderResult.status})`);
+        botState.tradedThisWindow = true;
+        return;
+      }
+
+      if (ladderResult.buyOrderId) recordBotOrderId(ladderResult.buyOrderId);
+
+      const actualEntryPriceDollars = ladderResult.buyPriceCents / 100;
       const position: BotPosition = {
         bot: 'grok15min',
         ticker: market.ticker,
         side,
         contracts,
-        entryPrice: entryPriceDollars,
-        totalCost: contracts * entryPriceDollars,
+        entryPrice: actualEntryPriceDollars,
+        totalCost: contracts * actualEntryPriceDollars,
         entryTime: new Date().toISOString(),
         btcPriceAtEntry: btcPrice,
-        orderId: response.order.order_id,
+        orderId: ladderResult.buyOrderId,
         fills: [],
       };
 
@@ -519,7 +552,11 @@ async function grokFifteenMinBotLoop(): Promise<void> {
       pos.grok15min = position;
       writeBotPositions(pos);
 
-      console.log(`[GROK 15MIN] Order placed | ID: ${response.order.order_id}`);
+      const saving = askCents - ladderResult.buyPriceCents;
+      console.log(
+        `[GROK 15MIN] Ladder entry | ID: ${ladderResult.buyOrderId ?? 'n/a'} | ` +
+        `${ladderResult.buyPriceCents}¢ (saved ${saving >= 0 ? saving : 0}¢)`
+      );
     } catch (err) {
       botState.lastError = err instanceof Error ? err.message : String(err);
       console.error('[GROK 15MIN] Order failed:', err);

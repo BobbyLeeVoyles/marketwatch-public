@@ -226,5 +226,14 @@ export interface BotConfig {
     exitCaptureRate: number;         // capture rate threshold to exit (0.25 = 25%)
     maxEntryMinute15: number;        // latest minute-in-15min-window to enter
     minEntryMinute: number;          // earliest minute to enter (both window types)
+    // Spread ladder config
+    ladderStepCents: number;         // cents inside ask for each sell placement
+    ladderMaxSteps: number;          // max iterations before going direct
+    ladderTickMs: number;            // polling interval in ms
+    ladderTargetDiscount: number;    // ENTRY: buy when ask drops this many cents from start
+    minPriceEdgeCents: number;       // grokFifteenMinBot: skip if abs(yes_ask - 50) < this
+    // OTM spike hunter config
+    spikeVelocityMultiplier: number; // OTM wakeup fires when |velocity| >= threshold × this
+    maxOtmAskCents: number;          // max ask price for OTM spike candidates (¢)
   };
 }

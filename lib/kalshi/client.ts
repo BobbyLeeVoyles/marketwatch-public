@@ -20,6 +20,7 @@ import {
 import {
   KalshiMarket,
   KalshiBalance,
+  KalshiOrderBook,
 } from './types';
 
 let clientInstance: KalshiClient | null = null;
@@ -166,6 +167,24 @@ export class KalshiClient {
       return response.data;
     } catch (error: any) {
       throw new Error(`Failed to get orders: ${error.response?.data?.error?.message || error.message}`);
+    }
+  }
+
+  /**
+   * Get order book depth for a market
+   * Returns yes bids only (binary markets: YES_bid at X¢ ≡ NO_ask at (100−X)¢)
+   */
+  async getOrderBook(ticker: string, depth?: number): Promise<KalshiOrderBook> {
+    try {
+      const response = await this.marketApi.getMarketOrderbook(ticker, depth);
+      const ob = response.data.orderbook;
+      return {
+        ticker,
+        yes: ((ob['true'] as Array<Array<number>>) || []) as Array<[number, number]>,
+        no: ((ob['false'] as Array<Array<number>>) || []) as Array<[number, number]>,
+      };
+    } catch (error: any) {
+      throw new Error(`Failed to get order book: ${error.response?.data?.error?.message || error.message}`);
     }
   }
 
