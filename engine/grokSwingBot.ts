@@ -18,8 +18,9 @@
  */
 
 import { getKalshiClient } from '@/lib/kalshi/client';
-import { getPrice } from './btcFeed';
+import { getPrice, getVelocity } from './btcFeed';
 import { readBotConfig } from '@/lib/utils/botConfig';
+import { appendSession, updateOutcome, getMemorySummary } from '@/lib/ai/botMemory';
 import { logTradeToFile, openTradeLifecycle, closeTradeLifecycle } from './positionTracker';
 import { getMarketCached, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder } from './kalshiTrader';
@@ -133,8 +134,6 @@ interface GrokSwingBotState {
   currentHourlyWindowKey: string;
   hourlyWindowOpenBtcPrice: number;
 
-  // Signal detection: rolling ~90s ring buffer
-  btcPriceHistory: Array<{ price: number; ts: number }>;
   lastSignalWakeupTime: number;  // cooldown: min 90s between wakeups
   lastGrokExitCheckTime: number; // normal 3-min exit check cycle
 
@@ -215,6 +214,14 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
         }
 
         console.log(`[SWING] Settlement ${isWin ? 'WIN' : 'LOSS'} | ${pos.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        // Update bot memory non-blocking
+        setImmediate(() => {
+          const entryD = new Date(pos.entryTime);
+          const wk = item.windowType === 'hourly'
+            ? `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}`
+            : `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}-${Math.floor(entryD.getMinutes() / 15) * 15}`;
+          updateOutcome('grokSwing', wk, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+        });
         continue; // removed from surviving
       }
 
@@ -286,6 +293,14 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
           }
 
           console.log(`[SWING] Exit: ${exitReason} | ${pos.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+          // Update bot memory non-blocking
+          setImmediate(() => {
+            const entryD = new Date(pos.entryTime);
+            const wk = item.windowType === 'hourly'
+              ? `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}`
+              : `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}-${Math.floor(entryD.getMinutes() / 15) * 15}`;
+            updateOutcome('grokSwing', wk, breakdown.netPnL > 0 ? 'WIN' : 'LOSS', breakdown.netPnL);
+          });
           // Don't add to surviving — position closed
         } catch (err) {
           console.error(`[SWING] Exit failed for ${pos.ticker}:`, err instanceof Error ? err.message : err);
@@ -307,13 +322,7 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
   }
 
   // Compute current velocity for exit style decision
-  const nowTs2 = Date.now();
-  const cutoff60 = nowTs2 - 60_000;
-  const window60s = botState.btcPriceHistory.filter(h => h.ts >= cutoff60);
-  const currentVelocity = window60s.length >= 2
-    ? (window60s[window60s.length - 1].price - window60s[0].price) /
-      ((window60s[window60s.length - 1].ts - window60s[0].ts) / 60_000)
-    : 0;
+  const currentVelocity = getVelocity();
   const exitStyle: 'direct' | 'ladder' =
     Math.abs(currentVelocity) > arbConfig.velocityThresholdPerMin * 0.5 ? 'direct' : 'ladder';
 
@@ -517,6 +526,9 @@ async function grokSwingWakeup(
     fairYesPct: estimateFairYes(btcPrice, strike, roughSigma, minsRemaining) * 100,
   }));
 
+  const memoryContext = getMemorySummary('grokSwing');
+  const windowKey = windowType === 'hourly' ? getHourlyWindowKey() : get15MinWindowKey();
+
   const prompt = buildSwingEntryPrompt({
     utcTime: new Date().toISOString(),
     btcPrice,
@@ -529,6 +541,7 @@ async function grokSwingWakeup(
     strikes: strikesForPrompt,
     otmMode,
     capitalPerTrade: arbConfig.capitalPerTrade,
+    memoryContext,
   });
 
   const decision = await getGrokSwingEntry(prompt, otmMode ? 'grokSpikeOtm' : 'grokSwing');
@@ -538,6 +551,17 @@ async function grokSwingWakeup(
     (decision.action === 'ENTER' ? ` ${decision.side.toUpperCase()} ${decision.ticker}` : '') +
     ` — "${decision.reason}"`
   );
+
+  // Append session record non-blocking (fire-and-forget)
+  setImmediate(() => {
+    appendSession('grokSwing', {
+      windowKey,
+      timestamp: new Date().toISOString(),
+      decision: decision.action,
+      reason: decision.reason.substring(0, 60),
+      context: { btcPrice, velocity, obi: 0 },
+    });
+  });
 
   if (decision.action !== 'ENTER') return;
 
@@ -679,11 +703,6 @@ async function swingBotLoop(): Promise<void> {
       botState.lastError = undefined;
     }
 
-    // Update BTC price history (rolling 90s ring buffer)
-    const nowTs = Date.now();
-    botState.btcPriceHistory.push({ price: btcPrice, ts: nowTs });
-    botState.btcPriceHistory = botState.btcPriceHistory.filter(h => h.ts >= nowTs - 90_000);
-
     // ── Window key resets ────────────────────────────────────────────────────
 
     const windowKey = get15MinWindowKey();
@@ -729,12 +748,7 @@ async function swingBotLoop(): Promise<void> {
 
     // ── Signal detection ─────────────────────────────────────────────────────
 
-    const cutoff60 = nowTs - 60_000;
-    const window60s = botState.btcPriceHistory.filter(h => h.ts >= cutoff60);
-    const velocity = window60s.length >= 2
-      ? (window60s[window60s.length - 1].price - window60s[0].price) /
-        ((window60s[window60s.length - 1].ts - window60s[0].ts) / 60_000)
-      : 0;
+    const velocity = getVelocity();
 
     const velocityOk = Math.abs(velocity) >= arbConfig.velocityThresholdPerMin;
     const now = new Date();
@@ -819,7 +833,6 @@ export function startGrokSwingBot(): void {
     currentHourlyWindowKey: getHourlyWindowKey(),
     hourlyWindowOpenBtcPrice: btcPrice > 0 ? btcPrice : 0,
 
-    btcPriceHistory: btcPrice > 0 ? [{ price: btcPrice, ts: Date.now() }] : [],
     lastSignalWakeupTime: 0,
     lastGrokExitCheckTime: 0,
 

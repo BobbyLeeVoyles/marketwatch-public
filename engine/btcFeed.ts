@@ -122,6 +122,7 @@ function connect(onPrice?: (price: number) => void): void {
         const msg = JSON.parse(data.toString());
         if (msg.p) {
           currentPrice = parseFloat(msg.p);
+          recordPriceTick(currentPrice);
           if (isFirstMessage) {
             console.log(`[BTC-FEED] ✓ Receiving price updates (BTC: $${currentPrice.toFixed(2)})`);
           }
@@ -321,6 +322,59 @@ export async function fetchFundingRate(): Promise<FundingRateData | null> {
   return null;
 }
 
+// ─── Shared velocity ring buffer ─────────────────────────────────────────────
+
+const btcPriceHistory: Array<{ price: number; ts: number }> = [];
+const VELOCITY_MAX_WINDOW_MS = 120_000; // keep up to 120s of history
+
+export function recordPriceTick(price: number): void {
+  const now = Date.now();
+  btcPriceHistory.push({ price, ts: now });
+  // Trim entries older than max window
+  const cutoff = now - VELOCITY_MAX_WINDOW_MS;
+  while (btcPriceHistory.length > 0 && btcPriceHistory[0].ts < cutoff) {
+    btcPriceHistory.shift();
+  }
+}
+
+/** Returns BTC velocity in $/min over the given window (default 60s). */
+export function getVelocity(windowMs = 60_000): number {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const window = btcPriceHistory.filter(h => h.ts >= cutoff);
+  if (window.length < 2) return 0;
+  const elapsed = (window[window.length - 1].ts - window[0].ts) / 60_000;
+  if (elapsed <= 0) return 0;
+  return (window[window.length - 1].price - window[0].price) / elapsed;
+}
+
+/** Count consecutive candles in the same direction from the most recent candle backward. */
+export function getMomentumStreak(
+  candles: import('@/lib/types').FiveMinCandle[],
+  minMovePct = 0.05,
+): { direction: 'up' | 'down' | 'flat'; streak: number } {
+  if (candles.length === 0) return { direction: 'flat', streak: 0 };
+
+  const candleDir = (c: import('@/lib/types').FiveMinCandle): 'up' | 'down' | 'flat' => {
+    const movePct = Math.abs(c.close - c.open) / c.open * 100;
+    if (movePct < minMovePct) return 'flat';
+    return c.close > c.open ? 'up' : 'down';
+  };
+
+  const dir = candleDir(candles[candles.length - 1]);
+  if (dir === 'flat') return { direction: 'flat', streak: 1 };
+
+  let streak = 1;
+  for (let i = candles.length - 2; i >= 0; i--) {
+    if (candleDir(candles[i]) === dir) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  return { direction: dir, streak };
+}
+
 // ─── Order book imbalance ─────────────────────────────────────────────────────
 
 export interface OrderBookImbalance {
@@ -329,13 +383,14 @@ export interface OrderBookImbalance {
   bidPct: number;     // bid depth as % of total (0-100)
   askPct: number;     // ask depth as % of total (0-100)
   imbalance: number;  // bid/ask ratio (>1 = bid-heavy = bullish)
+  source: 'coinbase' | 'binance';  // which exchange provided this data
 }
 
 let cachedOBI: OrderBookImbalance | null = null;
 let lastOBIFetch = 0;
 const OBI_REFRESH_MS = 30_000; // 30-second refresh
 
-function computeOBI(bids: [string, string][], asks: [string, string][]): OrderBookImbalance | null {
+function computeOBI(bids: [string, string][], asks: [string, string][], source: 'coinbase' | 'binance'): OrderBookImbalance | null {
   const bidDepth = bids.slice(0, 20).reduce((sum, [, qty]) => sum + parseFloat(qty), 0);
   const askDepth = asks.slice(0, 20).reduce((sum, [, qty]) => sum + parseFloat(qty), 0);
   const total = bidDepth + askDepth;
@@ -346,6 +401,7 @@ function computeOBI(bids: [string, string][], asks: [string, string][]): OrderBo
     bidPct: Math.round((bidDepth / total) * 100),
     askPct: Math.round((askDepth / total) * 100),
     imbalance: askDepth > 0 ? bidDepth / askDepth : 1,
+    source,
   };
 }
 
@@ -363,15 +419,16 @@ export async function fetchOrderBookImbalance(): Promise<OrderBookImbalance | nu
       const data = await res.json();
       const bids: [string, string][] = (data.bids || []).map((b: string[]) => [b[0], b[1]] as [string, string]);
       const asks: [string, string][] = (data.asks || []).map((a: string[]) => [a[0], a[1]] as [string, string]);
-      const obi = computeOBI(bids, asks);
+      const obi = computeOBI(bids, asks, 'coinbase');
       if (obi) {
         cachedOBI = obi;
         lastOBIFetch = now;
+        console.log(`[BTC-FEED] OBI: coinbase — bid ${obi.bidPct}% / ask ${obi.askPct}% (ratio ${obi.imbalance.toFixed(2)})`);
         return cachedOBI;
       }
     }
   } catch {
-    // fall through to Binance
+    console.warn('[BTC-FEED] OBI: Coinbase failed, falling back to Binance');
   }
 
   // Fallback: Binance.US / Binance.com
@@ -387,10 +444,11 @@ export async function fetchOrderBookImbalance(): Promise<OrderBookImbalance | nu
       const data = await res.json();
       const bids: [string, string][] = data.bids || [];
       const asks: [string, string][] = data.asks || [];
-      const obi = computeOBI(bids, asks);
+      const obi = computeOBI(bids, asks, 'binance');
       if (obi) {
         cachedOBI = obi;
         lastOBIFetch = now;
+        console.log(`[BTC-FEED] OBI: binance — bid ${obi.bidPct}% / ask ${obi.askPct}% (ratio ${obi.imbalance.toFixed(2)})`);
         return cachedOBI;
       }
     } catch (err) {

@@ -113,6 +113,9 @@ export interface Build15MinPromptParams {
   regime: string;
   volumeRatio: number;
   algoSignal: AlgoSignalContext;
+  velocity?: number;          // $/min over last 60s (positive = up, negative = down)
+  momentumStreak?: { direction: 'up' | 'down' | 'flat'; streak: number };
+  memoryContext?: string;     // bot learning summary from botMemory
 }
 
 export function build15MinPrompt(p: Build15MinPromptParams): string {
@@ -120,9 +123,22 @@ export function build15MinPrompt(p: Build15MinPromptParams): string {
     ? `${p.fundingRate.ratePercent} (next: ${p.fundingRate.nextFundingTime.substr(11, 5)} UTC)`
     : 'unavailable';
 
+  const obiSource = p.orderBookImbalance?.source ? ` (${p.orderBookImbalance.source})` : '';
   const obiStr = p.orderBookImbalance
-    ? `${p.orderBookImbalance.bidPct}% bid / ${p.orderBookImbalance.askPct}% ask (ratio: ${p.orderBookImbalance.imbalance.toFixed(2)})`
+    ? `${p.orderBookImbalance.bidPct}% bid / ${p.orderBookImbalance.askPct}% ask (ratio: ${p.orderBookImbalance.imbalance.toFixed(2)})${obiSource}`
     : 'unavailable';
+
+  const velocityStr = p.velocity !== undefined
+    ? `BTC velocity (60s): ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min`
+    : null;
+  const streakStr = p.momentumStreak && p.momentumStreak.streak > 1
+    ? `Candle streak: ${p.momentumStreak.streak} consecutive ${p.momentumStreak.direction.toUpperCase()} (1-min)`
+    : null;
+  const momentumLine = [velocityStr, streakStr].filter(Boolean).join(' | ');
+
+  const memorySection = p.memoryContext
+    ? `\n── BOT MEMORY ──\n${p.memoryContext}\n`
+    : '';
 
   return `You are a BTC binary prediction market trader on Kalshi.
 Determine whether the next 15-minute KXBTC contract should be YES or NO.
@@ -131,12 +147,13 @@ Make your own independent judgment — the algo signal below is context, not ins
 UTC time: ${p.utcTime}
 Ticker: ${p.ticker}
 BTC spot: $${p.btcPrice.toFixed(2)}  |  24h change: ${p.btcChange24h >= 0 ? '+' : ''}${p.btcChange24h.toFixed(2)}%
-
+${momentumLine ? momentumLine + '\n' : ''}
 ── MARKET MICROSTRUCTURE ──
 Funding rate: ${fundingStr}
   [Positive = longs paying shorts = bearish pressure. Negative = shorts paying longs = bullish pressure.]
 BTC order book imbalance (top 20 levels): ${obiStr}
   [>1 bid/ask ratio = bid-heavy = bullish pressure]
+  [Note: BTC spot OBI reflects maker order flow which lags price during fast moves. Weight candle streak and velocity over OBI during directional momentum.]
 Kalshi YES mid: ${p.yesMid}¢ (${p.yesProb.toFixed(1)}%)  NO mid: ${p.noMid}¢ (${p.noProb.toFixed(1)}%)
 
 ── ADJACENT STRIKES (check for pricing errors) ──
@@ -154,7 +171,7 @@ Volume ratio (last vs avg): ${p.volumeRatio.toFixed(2)}x
 
 ── ALGO SIGNAL (context only — you make the final call) ──
 Signal: ${p.algoSignal.signal} — "${p.algoSignal.reason}" — confidence: ${p.algoSignal.confidence}%
-
+${memorySection}
 Use your X search tool to check BTC sentiment in the last 5–10 minutes if it would help.
 Look for exchange news, whale moves, regulatory announcements, or macro sentiment shifts.
 
@@ -189,6 +206,8 @@ export interface BuildHourlyPromptParams {
     unrealizedPnL: number;
   }>;
   orderBookDepth?: string;        // e.g. "bids: 43¢×5, 42¢×12 | thin zone: 44–46¢"
+  velocity?: number;              // $/min over last 60s
+  memoryContext?: string;         // bot learning summary from botMemory
 }
 
 export function buildHourlyPrompt(p: BuildHourlyPromptParams): string {
@@ -196,8 +215,9 @@ export function buildHourlyPrompt(p: BuildHourlyPromptParams): string {
     ? `${p.fundingRate.ratePercent} (next: ${p.fundingRate.nextFundingTime.substr(11, 5)} UTC)`
     : 'unavailable';
 
+  const obiSource = p.orderBookImbalance?.source ? ` (${p.orderBookImbalance.source})` : '';
   const obiStr = p.orderBookImbalance
-    ? `${p.orderBookImbalance.bidPct}% bid / ${p.orderBookImbalance.askPct}% ask (ratio: ${p.orderBookImbalance.imbalance.toFixed(2)})`
+    ? `${p.orderBookImbalance.bidPct}% bid / ${p.orderBookImbalance.askPct}% ask (ratio: ${p.orderBookImbalance.imbalance.toFixed(2)})${obiSource}`
     : 'unavailable';
 
   const openPositionsStr = p.currentPositions.length === 0
@@ -205,6 +225,14 @@ export function buildHourlyPrompt(p: BuildHourlyPromptParams): string {
     : p.currentPositions.map(pos =>
         `  ${pos.side.toUpperCase()} ${pos.ticker} — ${pos.contracts} contracts @ ${(pos.entryPrice * 100).toFixed(0)}¢ | P&L: ${pos.unrealizedPnL >= 0 ? '+' : ''}$${pos.unrealizedPnL.toFixed(2)}`
       ).join('\n');
+
+  const velocityLine = p.velocity !== undefined
+    ? `\nBTC velocity (60s): ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min`
+    : '';
+
+  const memorySection = p.memoryContext
+    ? `\n── BOT MEMORY ──\n${p.memoryContext}\n`
+    : '';
 
   return `You are a BTC binary prediction market trader on Kalshi managing a $${p.capitalBudget.toFixed(2)} budget this cycle.
 You may place one or more bets. Available strategies:
@@ -218,7 +246,7 @@ You may place one or more bets. Available strategies:
 Make your own independent judgment — the algo signal is context, not instruction.
 
 UTC time: ${p.utcTime}  |  Minutes remaining this hour: ${p.minutesRemaining}
-BTC spot: $${p.btcPrice.toFixed(2)}  |  24h change: ${p.btcChange24h >= 0 ? '+' : ''}${p.btcChange24h.toFixed(2)}%
+BTC spot: $${p.btcPrice.toFixed(2)}  |  24h change: ${p.btcChange24h >= 0 ? '+' : ''}${p.btcChange24h.toFixed(2)}%${velocityLine}
 
 ── AVAILABLE MARKETS (use exactly these tickers in your response) ──
 ${formatAdjacentStrikes(p.adjacentStrikes)}
@@ -234,6 +262,7 @@ ${openPositionsStr}
 Funding rate: ${fundingStr}
   [For 60-minute exposure, funding rate carries more weight than 15-min trades]
 BTC order book imbalance (top 20 levels): ${obiStr}${p.orderBookDepth ? `\nKalshi order book depth: ${p.orderBookDepth}\n  [thin zone = safe for ladder sells; deep bid zone = real buyers present]` : ''}
+  [Note: BTC spot OBI reflects maker order flow which lags price during fast moves. Weight velocity over OBI during directional momentum.]
 
 ── HOURLY PRICE ACTION (last 10 candles, oldest → newest) ──
 ${formatHourlyTable(p.hourlyCandles)}
@@ -245,7 +274,7 @@ Volume ratio: ${p.volumeRatio.toFixed(2)}x
 
 ── ALGO SIGNAL (context only) ──
 Signal: ${p.algoSignal.signal} — "${p.algoSignal.reason}" — confidence: ${p.algoSignal.confidence}%
-
+${memorySection}
 Use your X search tool to check BTC sentiment in the last 30 minutes.
 Look for news, whale moves, and macro events that could move price by the hour close.
 
@@ -395,9 +424,14 @@ export interface BuildSwingEntryPromptParams {
   orderBookDepth?: string;    // e.g. "bids: 43¢×5, 42¢×12 | thin zone: 44–46¢"
   otmMode?: boolean;          // true = OTM spike hunter: cheap contracts in spike direction
   capitalPerTrade?: number;   // used in OTM mode to show reward calc to Grok
+  memoryContext?: string;     // bot learning summary from botMemory
 }
 
 export function buildSwingEntryPrompt(p: BuildSwingEntryPromptParams): string {
+  const memorySection = p.memoryContext
+    ? `\n── BOT MEMORY ──\n${p.memoryContext}\n`
+    : '';
+
   // ── OTM spike mode: completely different framing ───────────────────────────
   if (p.otmMode) {
     const spikeDir = p.velocityDirection;
@@ -425,7 +459,7 @@ Window: ${p.windowType} | ${p.minutesRemaining.toFixed(1)} minutes remaining
 BTC spot: $${p.btcPrice.toFixed(2)}
 BTC velocity: ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min (${p.velocityDirection} spike)
 Hour-open BTC: $${p.atmBtcPrice.toFixed(0)} | Drift from open: $${p.atmDistance.toFixed(0)} ${p.velocityDirection}
-
+${memorySection}
 Strategy: These cheap OTM ${targetSide} contracts are $1,000–$1,250 away from current BTC and priced under 15¢. If this spike has momentum, BTC could reach (or approach) these strikes within ${p.minutesRemaining.toFixed(0)} minutes. The asymmetric payoff (10¢ → 90¢) makes a small position worth taking even at modest probability.
 
 ── OTM SPIKE CANDIDATES (${targetSide} contracts in spike direction) ──
@@ -479,7 +513,7 @@ Window: ${p.windowType} | ${p.minutesRemaining.toFixed(1)} minutes remaining
 BTC spot: $${p.btcPrice.toFixed(2)}
 BTC velocity: ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min (${p.velocityDirection})
 ATM reference (window-open price): $${p.atmBtcPrice.toFixed(0)} | Distance from ATM: $${p.atmDistance.toFixed(0)}
-
+${memorySection}
 Momentum context: ${momentumDesc}
 ${depthSection}
 ── STRIKES (sorted low → high, with edge vs fair value) ──

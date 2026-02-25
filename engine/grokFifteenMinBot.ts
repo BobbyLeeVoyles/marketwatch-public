@@ -6,7 +6,8 @@
  * Runs live with small capitalPerTrade ($3 default).
  */
 
-import { getPrice, fetch1MinCandles, fetch5MinCandles, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance } from './btcFeed';
+import { getPrice, fetch1MinCandles, fetch5MinCandles, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance, getVelocity, getMomentumStreak } from './btcFeed';
+import { appendSession, updateOutcome, getMemorySummary } from '@/lib/ai/botMemory';
 import { find15MinMarket, getMarketCached, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder, cancelAllOrders } from './kalshiTrader';
 import { runSpreadLadder } from './spreadLadder';
@@ -152,6 +153,11 @@ async function handleActivePosition(): Promise<void> {
       writeBotPositions(positions);
       botState.position = null;
       console.log(`[GROK 15MIN] Settlement ${isWin ? 'WIN' : 'LOSS'} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+      setImmediate(() => {
+        const entryD = new Date(position.entryTime);
+        const wk = `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}-${Math.floor(entryD.getMinutes() / 15) * 15}`;
+        updateOutcome('grok15min', wk, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+      });
       return;
     }
 
@@ -275,6 +281,11 @@ async function handleActivePosition(): Promise<void> {
             writeBotPositions(positions);
             botState.position = null;
             console.log(`[GROK 15MIN] Grok exit complete | P&L: $${breakdown.netPnL.toFixed(2)}`);
+          setImmediate(() => {
+            const entryD = new Date(position.entryTime);
+            const wk = `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}-${Math.floor(entryD.getMinutes() / 15) * 15}`;
+            updateOutcome('grok15min', wk, breakdown.netPnL > 0 ? 'WIN' : 'LOSS', breakdown.netPnL);
+          });
           } catch (err) {
             console.error('[GROK 15MIN] Grok exit sell failed:', err);
           }
@@ -355,6 +366,10 @@ async function grokFifteenMinBotLoop(): Promise<void> {
       fetchOrderBookImbalance(),
     ]);
 
+    const velocity = getVelocity();
+    const momentumStreak = getMomentumStreak(oneMinCandles);
+    const memoryContext = getMemorySummary('grok15min');
+
     if (fiveMinCandles.length < 3) return;
 
     const indicators = calculateIndicators(hourlyCandles, btcPrice);
@@ -428,6 +443,9 @@ async function grokFifteenMinBotLoop(): Promise<void> {
       regime,
       volumeRatio: fiveMinIndicators.volumeRatio,
       algoSignal,
+      velocity,
+      momentumStreak,
+      memoryContext,
     });
 
     botState.lastGrokCallTime = Date.now(); // start cooldown from point of call
@@ -464,10 +482,30 @@ async function grokFifteenMinBotLoop(): Promise<void> {
         `[GROK 15MIN] Skipping: ${decision.decision === 'SKIP' ? 'SKIP signal' : `confidence ${decision.confidence}% < threshold ${botConfig.confidenceThreshold}%`} | ` +
         `Will re-evaluate in ${GROK_ENTRY_COOLDOWN_MS / 60000}m`
       );
-      // Don't lock the window — let the cooldown handle re-evaluation cadence.
-      // Grok will get another look when GROK_ENTRY_COOLDOWN_MS elapses and time remains.
+      // Append SKIP session non-blocking
+      setImmediate(() => {
+        appendSession('grok15min', {
+          windowKey,
+          timestamp: new Date().toISOString(),
+          decision: 'SKIP',
+          reason: decision.reason.substring(0, 60),
+          context: { btcPrice, velocity, obi: obi?.imbalance ?? 0, rsi: fiveMinIndicators.rsi7, streak: momentumStreak.streak },
+          outcome: 'SKIP',
+        });
+      });
       return;
     }
+
+    // Append entry decision non-blocking (outcome filled later when position closes)
+    setImmediate(() => {
+      appendSession('grok15min', {
+        windowKey,
+        timestamp: new Date().toISOString(),
+        decision: decision.decision,
+        reason: decision.reason.substring(0, 60),
+        context: { btcPrice, velocity, obi: obi?.imbalance ?? 0, rsi: fiveMinIndicators.rsi7, streak: momentumStreak.streak },
+      });
+    });
 
     const side = decision.decision.toLowerCase() as 'yes' | 'no';
     const askCents = side === 'yes' ? market.yes_ask : market.no_ask;

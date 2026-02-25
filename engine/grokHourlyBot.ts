@@ -8,7 +8,8 @@
  * Supports multi-bet per cycle (directional, straddle, breakout).
  */
 
-import { getPrice, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance } from './btcFeed';
+import { getPrice, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance, getVelocity } from './btcFeed';
+import { appendSession, updateOutcome, getMemorySummary } from '@/lib/ai/botMemory';
 import { getMarketCached, parseTickerSettlementTime, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder, cancelAllOrders } from './kalshiTrader';
 import { runSpreadLadder } from './spreadLadder';
@@ -27,7 +28,7 @@ import * as path from 'path';
 const BOT_POSITIONS_FILE = path.resolve('./data/bot-positions.json');
 const LOOP_INTERVAL_MS = 10_000;
 const EXIT_CHECK_INTERVAL_MS = 3 * 60 * 1000;
-const GROK_ENTRY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between entry calls on SKIP
+const GROK_ENTRY_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes between entry calls (throughout full hour)
 
 interface GrokDecisionLog {
   timestamp: string;
@@ -148,6 +149,11 @@ async function handleActivePositions(arbConfig: ReturnType<typeof readBotConfig>
           exitReason: `Stale resolved: ${isWin ? 'WIN' : 'LOSS'}`,
         });
         console.log(`[GROK HOURLY] Stale settlement ${isWin ? 'WIN' : 'LOSS'} | ${leg.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        setImmediate(() => {
+          const entryD = new Date(leg.entryTime);
+          const wk = `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}`;
+          updateOutcome('grokHourly', wk, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+        });
         continue; // removed from survivingLegs
       }
 
@@ -170,6 +176,11 @@ async function handleActivePositions(arbConfig: ReturnType<typeof readBotConfig>
           exitReason: `Settlement ${isWin ? 'WIN' : 'LOSS'}`,
         });
         console.log(`[GROK HOURLY] Settlement ${isWin ? 'WIN' : 'LOSS'} | ${leg.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        setImmediate(() => {
+          const entryD = new Date(leg.entryTime);
+          const wk = `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}`;
+          updateOutcome('grokHourly', wk, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+        });
         continue;
       }
 
@@ -389,20 +400,11 @@ async function grokHourlyBotLoop(): Promise<void> {
     const capitalRemaining = botConfig.capitalPerTrade - botState.capitalDeployedThisHour;
     if (capitalRemaining < 1.00) return; // budget exhausted
 
-    // Only trade in first 15 minutes of the hour
+    // Stop accepting new entries when < 10 minutes remain in the hour
     const nowH = new Date();
     const minutesInHour = nowH.getMinutes();
-    if (minutesInHour >= 15) {
-      const nextWindowIn = 60 - minutesInHour;
-      if (nowH.getMinutes() % 5 === 0 && nowH.getSeconds() === 0) {
-        console.log(`[GROK HOURLY] Waiting for next hour — ${nextWindowIn}m remaining`);
-      }
-      return;
-    }
-
-    // Need at least 45 minutes remaining
     const minutesRemaining = 60 - minutesInHour;
-    if (minutesRemaining < 45) return;
+    if (minutesRemaining < 10) return;
 
     // Cooldown between Grok calls
     if (Date.now() - botState.lastGrokCallTime < GROK_ENTRY_COOLDOWN_MS) return;
@@ -442,6 +444,9 @@ async function grokHourlyBotLoop(): Promise<void> {
       fetchFundingRate(),
       fetchOrderBookImbalance(),
     ]);
+
+    const velocity = getVelocity();
+    const memoryContext = getMemorySummary('grokHourly');
 
     // Get algo signal as context
     const algoSignalRaw = checkConservativeSignal({
@@ -491,6 +496,8 @@ async function grokHourlyBotLoop(): Promise<void> {
         entryPrice: p.entryPrice,
         unrealizedPnL: 0, // approximation; market data not fetched here
       })),
+      velocity,
+      memoryContext,
     });
 
     botState.lastGrokCallTime = Date.now();
@@ -532,8 +539,30 @@ async function grokHourlyBotLoop(): Promise<void> {
         `[GROK HOURLY] Skipping: ${decision.bets.length === 0 ? 'no bets' : `confidence ${decision.confidence}% < ${botConfig.confidenceThreshold}%`} | ` +
         `Will re-evaluate in ${GROK_ENTRY_COOLDOWN_MS / 60000}m`
       );
+      // Append SKIP session non-blocking
+      setImmediate(() => {
+        appendSession('grokHourly', {
+          windowKey: hourKey,
+          timestamp: new Date().toISOString(),
+          decision: 'SKIP',
+          reason: decision.reason.substring(0, 60),
+          context: { btcPrice, velocity, obi: obi?.imbalance ?? 0 },
+          outcome: 'SKIP',
+        });
+      });
       return;
     }
+
+    // Append entry decision non-blocking (outcome filled in later)
+    setImmediate(() => {
+      appendSession('grokHourly', {
+        windowKey: hourKey,
+        timestamp: new Date().toISOString(),
+        decision: decision.bets.length > 0 ? decision.bets[0].side.toUpperCase() : 'ENTER',
+        reason: decision.reason.substring(0, 60),
+        context: { btcPrice, velocity, obi: obi?.imbalance ?? 0 },
+      });
+    });
 
     botState.positionSuggestedRisk = decision.suggested_risk;
 
@@ -543,14 +572,6 @@ async function grokHourlyBotLoop(): Promise<void> {
       const market = adjacentStrikes.find(s => s.ticker === bet.ticker);
       if (!market) {
         console.warn(`[GROK HOURLY] Bet ticker not found in adjacent strikes: ${bet.ticker} — skipping`);
-        continue;
-      }
-
-      const alreadyHeld = botState.positions.some(
-        p => p.ticker === bet.ticker && p.side === bet.side
-      );
-      if (alreadyHeld) {
-        console.log(`[GROK HOURLY] Already holding ${bet.side.toUpperCase()} on ${bet.ticker} — skipping duplicate`);
         continue;
       }
 
