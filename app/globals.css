@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  background-color: #0a0e27;
+  color: #e0e6ff;
+  font-size: 12px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Terminal scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0e27;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2540;
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #8b92b8;
+}
+
+/* Terminal panel */
+.terminal-panel {
+  background-color: #12162b;
+  border: 1px solid #1e2540;
+  padding: 12px;
+}
+
+.terminal-header {
+  font-size: 14px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #e0e6ff;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #1e2540;
+  margin-bottom: 8px;
+}
+
+/* Data values */
+.data-value {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.data-label {
+  font-size: 10px;
+  color: #8b92b8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  body {
+    font-size: 11px;
+  }
+
+  .terminal-panel {
+    padding: 8px;
+  }
+
+  .terminal-header {
+    font-size: 12px;
+  }
+}

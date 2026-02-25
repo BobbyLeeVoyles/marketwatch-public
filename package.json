@@ -1,0 +1,45 @@
+{
+  "name": "marketwatch",
+  "version": "1.0.0",
+  "description": "Prediction market quant  # BTC PREDICTION TERMINAL - Claude Code Build Spec",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "engine": "tsx engine/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:52674/git/BobbyLeeVoyles/Marketwatch"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "date-fns": "^4.1.0",
+    "dotenv": "^17.3.1",
+    "kalshi-typescript": "^3.6.0",
+    "next": "^14.2.35",
+    "openai": "^6.22.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^3.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "@types/react": "^19.2.13",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.5.13",
+    "autoprefixer": "^10.4.24",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^14.2.35",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.19",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  }
+}

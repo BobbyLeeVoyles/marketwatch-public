@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+# .env is committed with placeholder values — fill in your real credentials
+.env.local
+.env.production.local
+.env.development.local
+*.tsbuildinfo
+next-env.d.ts
+
+# Private keys and secrets (NEVER commit)
+*.pem
+*.key
+*.p8
+*.p12
+kalshi-private-key*
+
+# Python
+__pycache__/
+*.pyc
+
+# Engine data files (runtime state, not source)
+data/*.json
