@@ -16,7 +16,7 @@ import { startHourlyBot, stopHourlyBot, getHourlyBotStatus } from './hourlyBot';
 import { start15MinBot, stop15MinBot, get15MinBotStatus } from './fifteenMinBot';
 import { startGrok15MinBot, stopGrok15MinBot, getGrok15MinBotStatus } from './grokFifteenMinBot';
 import { startGrokHourlyBot, stopGrokHourlyBot, getGrokHourlyBotStatus } from './grokHourlyBot';
-import { startArbScanner, stopArbScanner, getArbScannerStatus } from './strikeSniper';
+import { startGrokSwingBot, stopGrokSwingBot, getGrokSwingBotStatus } from './grokSwingBot';
 import { startManualTradeWatcher, stopManualTradeWatcher } from './manualTradeWatcher';
 import { initKalshiClient, getKalshiClient } from '@/lib/kalshi/client';
 import { readBotConfig, updateBotConfig } from '@/lib/utils/botConfig';
@@ -173,7 +173,7 @@ class BotOrchestrator {
           startGrokHourlyBot();
           break;
         case 'arb':
-          startArbScanner();
+          startGrokSwingBot();
           break;
       }
 
@@ -207,7 +207,7 @@ class BotOrchestrator {
           stopGrokHourlyBot();
           break;
         case 'arb':
-          stopArbScanner();
+          stopGrokSwingBot();
           break;
       }
 
@@ -245,7 +245,7 @@ class BotOrchestrator {
       fifteenMin: get15MinBotStatus(),
       grok15min: getGrok15MinBotStatus(),
       grokHourly: getGrokHourlyBotStatus(),
-      arb: getArbScannerStatus(),
+      arb: getGrokSwingBotStatus(),
     };
   }
 

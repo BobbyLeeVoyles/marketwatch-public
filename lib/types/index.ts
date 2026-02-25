@@ -214,10 +214,17 @@ export interface BotConfig {
   };
   arb: {
     enabled: boolean;
-    capitalPerTrade: number;      // $ per trade per snipe
-    maxDailyLoss: number;         // daily stop ($)
-    momentumThreshold: number;    // % BTC move to trigger 15-min sniper
-    maxEntryPriceCents: number;   // max ¢ to pay for OTM contract
-    btcProximityDollars: number;  // max $ from strike for hourly dislocation sniper
+    capitalPerTrade: number;        // $ per trade per snipe
+    maxDailyLoss: number;           // daily stop ($)
+    momentumThreshold: number;      // % BTC move to trigger 15-min sniper (legacy)
+    maxEntryPriceCents: number;     // max ¢ to pay for OTM contract
+    btcProximityDollars: number;    // max $ from strike for hourly dislocation sniper (legacy)
+    // Swing bot config
+    velocityThresholdPerMin: number; // $/min BTC velocity to fire signal
+    atmProximityDollars: number;     // max $ from window-open price to qualify
+    limitDiscountCents: number;      // shave off ask by this many cents for IOC limit
+    exitCaptureRate: number;         // capture rate threshold to exit (0.25 = 25%)
+    maxEntryMinute15: number;        // latest minute-in-15min-window to enter
+    minEntryMinute: number;          // earliest minute to enter (both window types)
   };
 }

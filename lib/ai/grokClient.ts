@@ -19,7 +19,7 @@ interface GrokLogEntry {
   prompt: string;
   reasoning: string | null;  // chain-of-thought from reasoning models (null for non-reasoning)
   rawResponse: string;
-  parsed: GrokDecision | GrokExitCheck | GrokMultiExitCheck;
+  parsed: GrokDecision | GrokExitCheck | GrokMultiExitCheck | GrokSwingEntry;
   durationMs: number;
 }
 
@@ -58,6 +58,13 @@ export interface GrokExitCheck {
 
 export interface GrokMultiExitCheck {
   exits: Array<{ ticker: string; action: 'HOLD' | 'EXIT' }>;
+}
+
+export interface GrokSwingEntry {
+  action: 'ENTER' | 'SKIP';
+  side: 'yes' | 'no';
+  ticker: string;
+  reason: string;
 }
 
 const SAFE_SKIP: GrokDecision = {
@@ -186,6 +193,93 @@ function parseGrokMultiExitCheck(content: string): GrokMultiExitCheck {
   }
 
   return { exits };
+}
+
+function parseGrokSwingEntry(content: string): GrokSwingEntry {
+  const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+
+  if (!['ENTER', 'SKIP'].includes(parsed.action)) {
+    throw new Error(`Invalid action: ${parsed.action}`);
+  }
+
+  if (parsed.action === 'ENTER') {
+    if (!['yes', 'no'].includes(parsed.side)) {
+      throw new Error(`Invalid side for ENTER: ${parsed.side}`);
+    }
+    if (!parsed.ticker || typeof parsed.ticker !== 'string') {
+      throw new Error(`Invalid ticker for ENTER: ${parsed.ticker}`);
+    }
+  }
+
+  return {
+    action: parsed.action,
+    side: parsed.side === 'yes' ? 'yes' : 'no',
+    ticker: String(parsed.ticker || ''),
+    reason: String(parsed.reason || '').slice(0, 200),
+  };
+}
+
+/**
+ * Get a swing entry decision from Grok.
+ * Response: {"action":"ENTER"|"SKIP","side":"yes"|"no","ticker":"<exact>","reason":"<20 words>"}
+ * Retries up to 2 times. Returns SKIP on any error.
+ */
+export async function getGrokSwingEntry(prompt: string, bot?: string): Promise<GrokSwingEntry> {
+  const client = getXaiClient();
+  const model = getModel();
+
+  const SAFE_SWING_SKIP: GrokSwingEntry = {
+    action: 'SKIP',
+    side: 'no',
+    ticker: '',
+    reason: 'API error — skipping',
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const t0 = Date.now();
+    try {
+      const response = await client.chat.completions.create({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 400,
+      });
+
+      const message = response.choices[0]?.message;
+      const content = message?.content;
+      if (!content) throw new Error('Empty response from Grok');
+
+      const reasoning = (message as unknown as Record<string, unknown>)?.reasoning_content as string | null ?? null;
+
+      const parsed = parseGrokSwingEntry(content);
+      appendGrokLog({
+        timestamp: new Date().toISOString(),
+        type: 'entry-decision',
+        bot,
+        prompt,
+        reasoning,
+        rawResponse: content,
+        parsed,
+        durationMs: Date.now() - t0,
+      });
+
+      if (reasoning) {
+        console.log(`[GROK] Swing reasoning (${bot ?? 'unknown'}):\n${reasoning.slice(0, 400)}${reasoning.length > 400 ? '…' : ''}`);
+      }
+
+      return parsed;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[GROK] Swing entry attempt ${attempt}/2 failed: ${msg}`);
+      if (attempt < 2) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  console.warn('[GROK] Swing entry failed — returning SKIP');
+  return SAFE_SWING_SKIP;
 }
 
 /**

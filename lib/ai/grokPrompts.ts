@@ -375,6 +375,74 @@ Respond only with valid JSON — no markdown, no extra text:
 Use exactly these tickers: ${tickerList}`;
 }
 
+export interface BuildSwingEntryPromptParams {
+  utcTime: string;
+  btcPrice: number;
+  velocity: number;           // $/min — positive = up, negative = down
+  velocityDirection: 'up' | 'down';
+  atmBtcPrice: number;        // window-open BTC price (ATM reference)
+  atmDistance: number;        // |btcPrice - atmBtcPrice| in dollars
+  minutesRemaining: number;
+  windowType: '15min' | 'hourly';
+  strikes: Array<{
+    ticker: string;
+    strike: number;
+    yesAsk: number;     // cents
+    noAsk: number;      // cents
+    fairYesPct: number; // 0–100 from estimateFairYes
+  }>;
+}
+
+export function buildSwingEntryPrompt(p: BuildSwingEntryPromptParams): string {
+  const strikeRows = p.strikes
+    .sort((a, b) => a.strike - b.strike)
+    .map(s => {
+      const fairYesCents = s.fairYesPct;
+      const fairNoCents = 100 - s.fairYesPct;
+      const yesEdge = (s.yesAsk - fairYesCents).toFixed(1);
+      const noEdge = (s.noAsk - fairNoCents).toFixed(1);
+      const yesTag = s.yesAsk < fairYesCents - 5 ? ' ← CHEAP' : s.yesAsk > fairYesCents + 5 ? ' ← DEAR' : '';
+      const noTag = s.noAsk < fairNoCents - 5 ? ' ← CHEAP' : s.noAsk > fairNoCents + 5 ? ' ← DEAR' : '';
+      return (
+        `  ${s.ticker}  $${s.strike.toLocaleString()}\n` +
+        `    YES ask:${s.yesAsk}¢  fair:${fairYesCents.toFixed(1)}¢  edge:${Number(yesEdge) >= 0 ? '+' : ''}${yesEdge}¢${yesTag}\n` +
+        `    NO  ask:${s.noAsk}¢  fair:${fairNoCents.toFixed(1)}¢  edge:${Number(noEdge) >= 0 ? '+' : ''}${noEdge}¢${noTag}`
+      );
+    })
+    .join('\n');
+
+  const momentumDesc = p.velocityDirection === 'up'
+    ? `BTC is rising at ${p.velocity.toFixed(0)} $/min — YES contracts may have been bid ahead of BTC`
+    : `BTC is falling at ${Math.abs(p.velocity).toFixed(0)} $/min — NO contracts may have been bid ahead of BTC`;
+
+  return `You are trading BTC binary contracts on Kalshi. Momentum traders have pushed option prices ahead of BTC's actual position — there may be a swing entry here.
+
+Strategy: Buy the contract that is priced cheaply relative to its fair value given BTC's velocity. Exit rule-based at 25% capture rate — you don't need to predict settlement, just an early price reversion.
+
+UTC time: ${p.utcTime}
+Window: ${p.windowType} | ${p.minutesRemaining.toFixed(1)} minutes remaining
+BTC spot: $${p.btcPrice.toFixed(2)}
+BTC velocity: ${p.velocity >= 0 ? '+' : ''}${p.velocity.toFixed(0)} $/min (${p.velocityDirection})
+ATM reference (window-open price): $${p.atmBtcPrice.toFixed(0)} | Distance from ATM: $${p.atmDistance.toFixed(0)}
+
+Momentum context: ${momentumDesc}
+
+── STRIKES (sorted low → high, with edge vs fair value) ──
+[edge < 0 = contract cheaper than fair → potential buy; edge > 0 = overpriced → skip]
+${strikeRows}
+
+Decision criteria:
+• ENTER if at least one side shows edge ≤ −5¢ (meaningfully cheaper than fair value)
+• ENTER only if BTC velocity direction aligns with the chosen side winning
+• ENTER only if ${p.minutesRemaining.toFixed(0)}+ minutes provides enough time for price to revert
+• SKIP if prices look fair or BTC velocity is inconsistent with a clear direction
+
+Respond ONLY with valid JSON — no markdown, no extra text:
+{"action":"ENTER","side":"yes"|"no","ticker":"<exact ticker from above>","reason":"<20 words max>"}
+or
+{"action":"SKIP","side":"","ticker":"","reason":"<20 words max>"}`;
+}
+
 function getSessionContext(utc: Date): string {
   const hour = utc.getUTCHours();
   if (hour >= 13 && hour < 17) return 'US market hours (13:30-17:00 UTC) — high volatility, 3x normal BTC volume';

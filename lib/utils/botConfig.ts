@@ -42,9 +42,15 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     enabled: false,
     capitalPerTrade: 5,
     maxDailyLoss: 20,
-    momentumThreshold: 0.8,   // % BTC move — backtest optimum (89 trades, Sharpe +47.98)
-    maxEntryPriceCents: 15,   // max ¢ to pay — backtest optimum
-    btcProximityDollars: 300, // $ from strike — backtest optimum (Sharpe +20.74)
+    momentumThreshold: 0.8,         // legacy field (unused by swing bot)
+    maxEntryPriceCents: 45,         // max ¢ to pay for swing entry
+    btcProximityDollars: 300,       // legacy field (unused by swing bot)
+    velocityThresholdPerMin: 150,   // $/min BTC velocity to fire signal
+    atmProximityDollars: 400,       // max $ from window-open price to qualify
+    limitDiscountCents: 1,          // shave off ask for IOC limit
+    exitCaptureRate: 0.25,          // 25% capture rate exit
+    maxEntryMinute15: 12,           // latest minute-in-15min-window to enter
+    minEntryMinute: 2,              // earliest minute to enter
   },
 };
 
