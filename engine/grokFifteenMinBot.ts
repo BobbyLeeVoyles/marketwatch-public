@@ -51,6 +51,8 @@ interface Grok15MinBotState {
   lastDecisions: GrokDecisionLog[];  // last 5 decisions
   lastExitCheck: number;             // timestamp
   lastGrokCallTime: number;          // timestamp of last entry Grok call (for cooldown)
+  sniperPosition: BotPosition | null;
+  lastSniperWindowKey: string;
 }
 
 let botState: Grok15MinBotState | null = null;
@@ -94,12 +96,64 @@ function calculateDailyPnL(): { pnl: number; count: number } {
   } catch { return { pnl: 0, count: 0 }; }
 }
 
-async function handleActivePosition(): Promise<void> {
+async function handleActivePosition(botConfig: ReturnType<typeof readBotConfig>['grok15min']): Promise<void> {
   if (!botState?.position) return;
   const position = botState.position;
 
   try {
     const market = await getMarketCached(position.ticker);
+
+    // === DANGER ZONE: fast-path exit every tick (not gated by 3-min interval) ===
+    if (botConfig.dangerZoneExitEnabled !== false) {
+      const secondsRemaining = (new Date(market.close_time).getTime() - Date.now()) / 1000;
+      if (secondsRemaining > 0 && secondsRemaining < 60) {
+        const currentBid = position.side === 'yes' ? market.yes_bid : market.no_bid;
+        if (currentBid >= (botConfig.dangerZoneExitCents ?? 90)) {
+          const btcPrice = getPrice();
+          const strikeMatch = position.ticker.match(/-T(\d+(?:\.\d+)?)$/);
+          const strike = strikeMatch ? parseFloat(strikeMatch[1]) : 0;
+          if (strike > 0) {
+            const margin = position.side === 'yes' ? btcPrice - strike : strike - btcPrice;
+            const threshold = botConfig.dangerZoneBtcProximityDollars ?? 200;
+            if (margin > 0 && margin < threshold) {
+              console.log(
+                `[GROK 15MIN] Danger zone exit: ${secondsRemaining.toFixed(0)}s left | ` +
+                `${position.side.toUpperCase()} bid=${currentBid}¢ | BTC $${margin.toFixed(0)} from strike`
+              );
+              try {
+                await placeOrder('grok15min', position.ticker, position.side, 'sell', position.contracts, currentBid);
+                const breakdown = calculateKalshiFeeBreakdown(position.contracts, position.entryPrice, currentBid / 100, 'early');
+                logTradeToFile({
+                  id: position.orderId || `grok15min-${Date.now()}`,
+                  timestamp: position.entryTime,
+                  strategy: 'grok15min',
+                  direction: position.side,
+                  entryPrice: position.entryPrice,
+                  exitPrice: currentBid / 100,
+                  exitType: 'early',
+                  contracts: position.contracts,
+                  netPnL: breakdown.netPnL,
+                  won: breakdown.netPnL > 0,
+                  exitReason: `Danger zone: ${secondsRemaining.toFixed(0)}s left, BTC $${margin.toFixed(0)} from strike`,
+                });
+                const positions = readBotPositions();
+                delete positions.grok15min;
+                writeBotPositions(positions);
+                botState.position = null;
+                setImmediate(() => {
+                  const entryD = new Date(position.entryTime);
+                  const wk = `${entryD.toISOString().split('T')[0]}-${entryD.getUTCHours()}-${Math.floor(entryD.getMinutes() / 15) * 15}`;
+                  updateOutcome('grok15min', wk, breakdown.netPnL > 0 ? 'WIN' : 'LOSS', breakdown.netPnL);
+                });
+              } catch (err) {
+                console.error('[GROK 15MIN] Danger zone exit failed:', err);
+              }
+              return;
+            }
+          }
+        }
+      }
+    }
 
     // Check for stale position (market closed > 15 min ago)
     const closeTime = new Date(market.close_time).getTime();
@@ -297,6 +351,220 @@ async function handleActivePosition(): Promise<void> {
   }
 }
 
+async function handleSniperPosition(botConfig: ReturnType<typeof readBotConfig>['grok15min']): Promise<void> {
+  if (!botState?.sniperPosition) return;
+  const position = botState.sniperPosition;
+
+  try {
+    const market = await getMarketCached(position.ticker);
+
+    // Stale position: closed > 15 min ago
+    const closeTime = new Date(market.close_time).getTime();
+    const minutesSinceClose = (Date.now() - closeTime) / 60000;
+
+    if (minutesSinceClose > 15 && market.status !== 'settled') {
+      clearMarketCache();
+      const fresh = await getMarketCached(position.ticker);
+      const isWin = fresh.result === position.side;
+      const exitPrice = isWin ? 1.0 : 0.0;
+      const breakdown = calculateKalshiFeeBreakdown(position.contracts, position.entryPrice, exitPrice, 'settlement');
+      logTradeToFile({
+        id: position.orderId || `grok15min-sniper-${Date.now()}`,
+        timestamp: position.entryTime,
+        strategy: 'grok15min',
+        direction: position.side,
+        entryPrice: position.entryPrice,
+        exitPrice,
+        exitType: 'settlement',
+        contracts: position.contracts,
+        netPnL: breakdown.netPnL,
+        won: isWin,
+        exitReason: `Sniper stale resolved: ${isWin ? 'WIN' : 'LOSS'}`,
+      });
+      const positions = readBotPositions();
+      delete (positions as any)['grok15min-sniper'];
+      writeBotPositions(positions);
+      botState.sniperPosition = null;
+      return;
+    }
+
+    if (market.status === 'settled') {
+      const isWin = market.result === position.side;
+      const exitPrice = isWin ? 1.0 : 0.0;
+      const breakdown = calculateKalshiFeeBreakdown(position.contracts, position.entryPrice, exitPrice, 'settlement');
+      logTradeToFile({
+        id: position.orderId || `grok15min-sniper-${Date.now()}`,
+        timestamp: position.entryTime,
+        strategy: 'grok15min',
+        direction: position.side,
+        entryPrice: position.entryPrice,
+        exitPrice,
+        exitType: 'settlement',
+        contracts: position.contracts,
+        netPnL: breakdown.netPnL,
+        won: isWin,
+        exitReason: `Sniper settlement ${isWin ? 'WIN' : 'LOSS'}`,
+      });
+      const positions = readBotPositions();
+      delete (positions as any)['grok15min-sniper'];
+      writeBotPositions(positions);
+      botState.sniperPosition = null;
+      console.log(`[GROK 15MIN] Sniper settlement ${isWin ? 'WIN' : 'LOSS'} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+    }
+
+    // Resting 90¢ sell order handles exit — nothing else to do while open
+  } catch (err) {
+    console.error('[GROK 15MIN] Sniper position monitoring error:', err);
+  }
+}
+
+async function runLastMinuteSniper(botConfig: ReturnType<typeof readBotConfig>['grok15min']): Promise<void> {
+  if (!botState) return;
+  if (botConfig.sniperEnabled === false) return;
+
+  // Only activate in the last N minutes
+  const activationMinutes = botConfig.sniperActivationMinutes ?? 3;
+  const now = new Date();
+  const minuteInWindow = now.getMinutes() % 15;
+  const minsRemaining = 15 - minuteInWindow;
+  if (minsRemaining > activationMinutes) return;
+
+  const currentWindowKey = botState.currentWindowKey;
+  if (botState.lastSniperWindowKey === currentWindowKey) return; // already fired this window
+
+  // Find active 15-min market
+  let market: KalshiMarket;
+  try {
+    const found = await find15MinMarket();
+    if (!found) return;
+    market = found;
+  } catch {
+    return;
+  }
+
+  // Use market.close_time for precise time remaining
+  const secondsRemaining = (new Date(market.close_time).getTime() - Date.now()) / 1000;
+  if (secondsRemaining <= 0) return;
+
+  const strikeMatch = market.ticker.match(/-T(\d+(?:\.\d+)?)$/);
+  if (!strikeMatch) return;
+  const strike = parseFloat(strikeMatch[1]);
+
+  const btcPrice = getPrice();
+  const proximity = botConfig.sniperBtcProximityDollars ?? 100;
+  const diff = btcPrice - strike; // positive = BTC above strike
+
+  if (Math.abs(diff) > proximity) return; // BTC not close enough
+
+  // Determine which side to buy
+  // BTC above strike → buy NO (wins if BTC drops below) — check no_ask
+  // BTC below strike → buy YES (wins if BTC rises above) — check yes_ask
+  const maxAsk = botConfig.sniperMaxAskCents ?? 3;
+  let sniperSide: 'yes' | 'no' | null = null;
+  let bestAskCents = 0;
+
+  const yesAsk = market.yes_ask;
+  const noAsk = market.no_ask;
+
+  if (diff > 0 && diff <= proximity) {
+    // BTC above strike — lottery: NO (if BTC dips below)
+    if (noAsk > 0 && noAsk <= maxAsk) {
+      sniperSide = 'no';
+      bestAskCents = noAsk;
+    }
+  } else if (diff < 0 && diff >= -proximity) {
+    // BTC below strike — lottery: YES (if BTC jumps above)
+    if (yesAsk > 0 && yesAsk <= maxAsk) {
+      sniperSide = 'yes';
+      bestAskCents = yesAsk;
+    }
+  }
+
+  if (diff === 0) {
+    // Exactly at strike — pick cheaper side
+    if (yesAsk > 0 && yesAsk <= maxAsk && (noAsk <= 0 || noAsk > maxAsk || yesAsk <= noAsk)) {
+      sniperSide = 'yes';
+      bestAskCents = yesAsk;
+    } else if (noAsk > 0 && noAsk <= maxAsk) {
+      sniperSide = 'no';
+      bestAskCents = noAsk;
+    }
+  }
+
+  if (!sniperSide) return; // no qualifying side
+
+  // Compute contract size
+  const minContracts = botConfig.sniperMinContracts ?? 100;
+  let contracts = minContracts;
+  try {
+    const balanceRes = await getKalshiClient().getBalance();
+    const bankroll = (balanceRes.balance + balanceRes.payout) / 100;
+    const threshold = botConfig.sniperBankrollThreshold ?? 300;
+    if (bankroll > threshold) {
+      const bankrollPct = botConfig.sniperBankrollPct ?? 0.01;
+      const dollarBudget = bankroll * bankrollPct;
+      const computed = Math.floor(dollarBudget / (bestAskCents / 100));
+      contracts = Math.max(computed, minContracts);
+    }
+  } catch (err) {
+    console.warn('[GROK 15MIN] Sniper: getBalance failed, using minContracts:', err);
+    contracts = minContracts;
+  }
+
+  console.log(
+    `[GROK 15MIN] Sniper: buying ${sniperSide.toUpperCase()} on ${market.ticker} | ` +
+    `ask=${bestAskCents}¢ | contracts=${contracts} | BTC $${Math.abs(diff).toFixed(0)} from strike | ${secondsRemaining.toFixed(0)}s left`
+  );
+
+  try {
+    const buyResult = await placeOrder('grok15min', market.ticker, sniperSide, 'buy', contracts, maxAsk);
+    const filledQty: number = (buyResult as any)?.filled_count ?? (buyResult as any)?.filledCount ?? 0;
+    const orderId: string | undefined = (buyResult as any)?.order_id ?? (buyResult as any)?.orderId;
+
+    if (filledQty <= 0) {
+      // No fill — cancel and abort
+      if (orderId) {
+        try { await getKalshiClient().cancelOrder(orderId); } catch { /* best-effort */ }
+      }
+      console.log('[GROK 15MIN] Sniper: buy did not fill — cancelled');
+      botState.lastSniperWindowKey = currentWindowKey;
+      return;
+    }
+
+    // Place resting sell at 90¢
+    const sellCents = botConfig.sniperSellCents ?? 90;
+    try {
+      await placeOrder('grok15min', market.ticker, sniperSide, 'sell', filledQty, sellCents);
+      console.log(`[GROK 15MIN] Sniper: resting sell placed at ${sellCents}¢ for ${filledQty} contracts`);
+    } catch (err) {
+      console.error('[GROK 15MIN] Sniper: resting sell failed:', err);
+    }
+
+    const sniperPos: BotPosition = {
+      bot: 'grok15min',
+      ticker: market.ticker,
+      side: sniperSide,
+      contracts: filledQty,
+      entryPrice: bestAskCents / 100,
+      totalCost: filledQty * (bestAskCents / 100),
+      entryTime: new Date().toISOString(),
+      btcPriceAtEntry: btcPrice,
+      orderId,
+      fills: [],
+    };
+
+    botState.sniperPosition = sniperPos;
+    botState.lastSniperWindowKey = currentWindowKey;
+
+    const allPositions = readBotPositions();
+    (allPositions as any)['grok15min-sniper'] = sniperPos;
+    writeBotPositions(allPositions);
+  } catch (err) {
+    console.error('[GROK 15MIN] Sniper: buy order failed:', err);
+    botState.lastSniperWindowKey = currentWindowKey; // prevent retry spam on error
+  }
+}
+
 async function grokFifteenMinBotLoop(): Promise<void> {
   if (!botState?.running) return;
   if (loopRunning) return; // previous tick still running (Grok API in progress)
@@ -329,15 +597,23 @@ async function grokFifteenMinBotLoop(): Promise<void> {
       botState.tradedThisWindow = false;
     }
 
-    // Monitor active position
+    // Sync positions from disk
     const positions = readBotPositions();
     botState.position = positions.grok15min || null;
-
-    if (botState.position) {
-      await handleActivePosition();
-      if (botState.tradedThisWindow) return;
+    if (!botState.sniperPosition) {
+      botState.sniperPosition = (positions as any)['grok15min-sniper'] || null;
     }
 
+    // Handle main position (includes danger-zone fast exit)
+    if (botState.position) await handleActivePosition(botConfig);
+
+    // Handle sniper position (always runs if position exists)
+    if (botState.sniperPosition) await handleSniperPosition(botConfig);
+
+    // Sniper opportunity check (always runs, ignores tradedThisWindow)
+    await runLastMinuteSniper(botConfig);
+
+    // Early return gate for Grok entry logic
     if (botState.tradedThisWindow) return;
 
     // Need at least 10 minutes remaining in the current window before entering
@@ -619,6 +895,7 @@ export function startGrok15MinBot(): void {
   // (tradedThisWindow resets naturally when the window key changes).
   const existingPositions = readBotPositions();
   const existingPosition = (existingPositions as any).grok15min || null;
+  const existingSniperPosition = (existingPositions as any)['grok15min-sniper'] || null;
 
   const existingMeta = (existingPositions as any).grok15minMeta;
   const currentWindowKey = get15MinWindowKey();
@@ -639,10 +916,15 @@ export function startGrok15MinBot(): void {
     lastDecisions: [],
     lastExitCheck: 0,
     lastGrokCallTime: restoredLastGrokCall,
+    sniperPosition: existingSniperPosition,
+    lastSniperWindowKey: existingSniperPosition ? currentWindowKey : '',
   };
 
   if (existingPosition) {
     console.log(`[GROK 15MIN] Resuming position: ${existingPosition.ticker} | ${existingPosition.side.toUpperCase()} ${existingPosition.contracts} @ ${(existingPosition.entryPrice * 100).toFixed(0)}¢`);
+  }
+  if (existingSniperPosition) {
+    console.log(`[GROK 15MIN] Resuming sniper position: ${existingSniperPosition.ticker} | ${existingSniperPosition.side.toUpperCase()} ${existingSniperPosition.contracts} @ ${(existingSniperPosition.entryPrice * 100).toFixed(0)}¢`);
   }
 
   // Clear any orphaned interval from a previous hot-reload

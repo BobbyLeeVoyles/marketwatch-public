@@ -14,12 +14,12 @@ const GROK_LOG_MAX = 500; // keep last 500 entries
 
 interface GrokLogEntry {
   timestamp: string;
-  type: 'entry-decision' | 'exit-check';
+  type: 'entry-decision' | 'exit-check' | 'chat';
   bot?: string;
   prompt: string;
   reasoning: string | null;  // chain-of-thought from reasoning models (null for non-reasoning)
   rawResponse: string;
-  parsed: GrokDecision | GrokExitCheck | GrokMultiExitCheck | GrokSwingEntry;
+  parsed: GrokDecision | GrokExitCheck | GrokMultiExitCheck | GrokSwingEntry | null;
   durationMs: number;
 }
 
@@ -385,6 +385,37 @@ export async function getGrokExitCheck(prompt: string, bot?: string): Promise<Gr
 
   console.warn('[GROK] Exit check failed — defaulting to HOLD');
   return SAFE_HOLD;
+}
+
+/**
+ * Single-turn conversational Q&A for the per-bot dashboard chat panel.
+ * No retries — user can resend. Higher temperature for natural language tone.
+ */
+export async function getGrokChat(prompt: string, bot?: string): Promise<string> {
+  const client = getXaiClient();
+  const t0 = Date.now();
+  try {
+    const res = await client.chat.completions.create({
+      model: getModel(),
+      temperature: 0.7,
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const answer = res.choices[0]?.message?.content?.trim() ?? 'No response.';
+    appendGrokLog({
+      timestamp: new Date().toISOString(),
+      type: 'chat',
+      bot,
+      prompt,
+      reasoning: null,
+      rawResponse: answer,
+      parsed: null,
+      durationMs: Date.now() - t0,
+    });
+    return answer;
+  } catch {
+    return 'Grok is unavailable right now.';
+  }
 }
 
 /**

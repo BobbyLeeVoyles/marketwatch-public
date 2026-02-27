@@ -35,6 +35,7 @@ export interface BotMemory {
   sessions: SessionRecord[];
   summary: string;          // precomputed statistical summary
   summaryUpdatedAt: string;
+  operatorNotes: string[];  // operator-written behavioral guidance (max 10)
 }
 
 function memoryFilePath(botId: string): string {
@@ -48,7 +49,7 @@ export function readBotMemory(botId: string): BotMemory {
       return JSON.parse(fs.readFileSync(fp, 'utf8')) as BotMemory;
     }
   } catch { /* ignore */ }
-  return { botId, sessions: [], summary: '', summaryUpdatedAt: '' };
+  return { botId, sessions: [], summary: '', summaryUpdatedAt: '', operatorNotes: [] };
 }
 
 function writeBotMemory(mem: BotMemory): void {
@@ -168,5 +169,16 @@ function refreshSummaryInternal(mem: BotMemory): void {
 /** Get the precomputed summary string to inject into a Grok prompt. */
 export function getMemorySummary(botId: string): string {
   const mem = readBotMemory(botId);
-  return mem.summary || 'Insufficient history (<5 sessions) — no pattern guidance yet.';
+  const base = mem.summary || 'Insufficient history (<5 sessions) — no pattern guidance yet.';
+  const notes = mem.operatorNotes ?? [];
+  if (notes.length === 0) return base;
+  const notesStr = notes.map(n => `  • ${n}`).join('\n');
+  return `${base}\n\nOperator guidance (follow unless contradicted by strong market signal):\n${notesStr}`;
+}
+
+/** Append an operator note to the bot's memory. Caps at 10, oldest dropped. */
+export function appendOperatorNote(botId: string, note: string): void {
+  const mem = readBotMemory(botId);
+  const notes = [...(mem.operatorNotes ?? []), note].slice(-10);
+  writeBotMemory({ ...mem, operatorNotes: notes });
 }

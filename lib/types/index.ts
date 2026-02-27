@@ -205,6 +205,19 @@ export interface BotConfig {
     confidenceThreshold: number;
     capitalPerTrade: number;
     maxDailyLoss: number;
+    // Danger-zone fast exit
+    dangerZoneExitEnabled?: boolean;
+    dangerZoneBtcProximityDollars?: number;
+    dangerZoneExitCents?: number;
+    // Last-minute price sniper
+    sniperEnabled?: boolean;
+    sniperMaxAskCents?: number;
+    sniperMinContracts?: number;
+    sniperBankrollPct?: number;
+    sniperBankrollThreshold?: number;
+    sniperSellCents?: number;
+    sniperBtcProximityDollars?: number;
+    sniperActivationMinutes?: number;
   };
   grokHourly: {
     enabled: boolean;

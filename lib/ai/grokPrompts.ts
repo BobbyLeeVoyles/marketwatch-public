@@ -532,6 +532,40 @@ or
 {"action":"SKIP","side":"","ticker":"","reason":"<20 words max>"}`;
 }
 
+export interface BuildBotChatPromptParams {
+  botId: string;
+  question: string;
+  memorySummary: string;
+  recentDecisions: Array<{ timestamp: string; decision: string; confidence?: number; reason?: string }>;
+}
+
+export function buildBotChatPrompt(p: BuildBotChatPromptParams): string {
+  const botNames: Record<string, string> = {
+    grok15min: 'GROK 15-MIN bot (trades 15-minute BTC binary contracts)',
+    grokHourly: 'GROK HOURLY bot (trades hourly BTC binary contracts)',
+    grokSwing:  'GROK SWING bot (signal-triggered scalper on BTC volatility spikes)',
+  };
+  const name = botNames[p.botId] ?? p.botId;
+
+  const decisionsStr = p.recentDecisions.length
+    ? p.recentDecisions.map(d =>
+        `  ${d.timestamp.slice(11, 16)} UTC: ${d.decision}${d.confidence != null ? ` (${d.confidence}%)` : ''}${d.reason ? ` — ${d.reason}` : ''}`
+      ).join('\n')
+    : '  No recent decisions logged.';
+
+  return `You are the ${name} on the Kalshi prediction market platform.
+
+Your learning memory (recent trade history):
+${p.memorySummary || 'No memory yet — fewer than 5 sessions recorded.'}
+
+Your last 5 decisions:
+${decisionsStr}
+
+The operator is asking you a question. Answer directly, honestly, and concisely in 2–4 sentences. Stay in character as a trading bot that understands its own recent behavior.
+
+Question: ${p.question}`;
+}
+
 function getSessionContext(utc: Date): string {
   const hour = utc.getUTCHours();
   if (hour >= 13 && hour < 17) return 'US market hours (13:30-17:00 UTC) — high volatility, 3x normal BTC volume';

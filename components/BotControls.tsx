@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 interface BotStatus {
   running: boolean;
@@ -54,6 +54,182 @@ interface ArbConfig {
   momentumThreshold: number;
   maxEntryPriceCents: number;
   btcProximityDollars: number;
+}
+
+// ─── Bot Insights Panel (Memory + Chat) ──────────────────────────────────────
+
+interface MemorySummaryData {
+  summary: string;
+  updatedAt: string;
+}
+
+interface ChatMessage {
+  role: 'user' | 'bot';
+  text: string;
+}
+
+function BotInsightsPanel({
+  botId,
+  summary,
+  updatedAt,
+  onMemoryRefresh,
+}: {
+  botId: string;
+  summary: string;
+  updatedAt: string;
+  onMemoryRefresh: () => void;
+}) {
+  const [memOpen, setMemOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<Record<number, 'saving' | 'saved'>>({});
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Track which user message index corresponds to each bot response
+  const lastUserMsgRef = useRef('');
+
+  useEffect(() => {
+    if (chatOpen) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, chatOpen]);
+
+  async function sendMessage() {
+    const q = input.trim();
+    if (!q || loading) return;
+    lastUserMsgRef.current = q;
+    setInput('');
+    setMessages(m => [...m.slice(-9), { role: 'user', text: q }]);
+    setLoading(true);
+    try {
+      const res = await fetch('/api/bot/chat', {
+        method: 'POST',
+        body: JSON.stringify({ botId, question: q }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      setMessages(m => [...m.slice(-9), { role: 'bot', text: data.answer ?? 'No response.' }]);
+    } catch {
+      setMessages(m => [...m.slice(-9), { role: 'bot', text: 'Failed to reach Grok.' }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveToMemory(idx: number, botAnswer: string) {
+    // Find the user message that preceded this bot message
+    const userMsg = messages.slice(0, idx).filter(m => m.role === 'user').at(-1)?.text ?? '';
+    const note = `Q: ${userMsg}\nA: ${botAnswer}`;
+    setSaveStatus(s => ({ ...s, [idx]: 'saving' }));
+    try {
+      await fetch('/api/bot/memory', {
+        method: 'POST',
+        body: JSON.stringify({ botId, note }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+      setSaveStatus(s => ({ ...s, [idx]: 'saved' }));
+      onMemoryRefresh();
+    } catch {
+      setSaveStatus(s => { const next = { ...s }; delete next[idx]; return next; });
+    }
+  }
+
+  const hasMemory = summary.trim() !== '';
+
+  return (
+    <div className="mt-2 text-[9px] border-t border-terminal-dim pt-2">
+      {/* Memory toggle */}
+      <button
+        onClick={() => setMemOpen(o => !o)}
+        className="flex items-center gap-1 text-terminal-muted hover:text-terminal-green transition-colors mb-1"
+      >
+        <span>Memory</span>
+        <span>{memOpen ? '▲' : '▼'}</span>
+      </button>
+      {memOpen && (
+        <div className="mb-2">
+          <pre className="text-[9px] bg-black border border-terminal-dim p-2 rounded whitespace-pre-wrap text-terminal-green font-mono leading-relaxed">
+            {hasMemory ? summary : 'No memory yet — fewer than 5 sessions recorded.'}
+          </pre>
+          {updatedAt && (
+            <div className="text-terminal-dim mt-1">
+              Updated: {new Date(updatedAt).toLocaleTimeString()}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Chat toggle */}
+      <button
+        onClick={() => setChatOpen(o => !o)}
+        className="flex items-center gap-1 text-terminal-muted hover:text-terminal-green transition-colors mb-1"
+      >
+        <span>Ask Bot</span>
+        <span>{chatOpen ? '▲' : '▼'}</span>
+      </button>
+      {chatOpen && (
+        <div>
+          {/* Message history */}
+          <div className="min-h-[40px] max-h-[200px] overflow-y-auto mb-2 space-y-1">
+            {messages.length === 0 && (
+              <div className="text-terminal-dim italic">Ask this bot anything about its behavior…</div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i}>
+                <div
+                  className={`px-2 py-1 rounded text-[9px] leading-snug ${
+                    m.role === 'user'
+                      ? 'text-right text-blue-300 bg-blue-950/30'
+                      : 'text-left text-terminal-green bg-terminal-dim/30'
+                  }`}
+                >
+                  {m.text}
+                </div>
+                {m.role === 'bot' && (
+                  <div className="text-right mt-0.5">
+                    {saveStatus[i] === 'saved' ? (
+                      <span className="text-terminal-green text-[8px]">Saved ✓</span>
+                    ) : (
+                      <button
+                        onClick={() => saveToMemory(i, m.text)}
+                        disabled={saveStatus[i] === 'saving'}
+                        className="text-terminal-dim hover:text-terminal-muted text-[8px] underline disabled:opacity-50"
+                      >
+                        {saveStatus[i] === 'saving' ? 'Saving…' : 'Save to memory'}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {loading && (
+              <div className="text-terminal-dim italic px-2 py-1">thinking…</div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+          {/* Input */}
+          <div className="flex gap-1">
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') sendMessage(); }}
+              placeholder="Ask this bot anything..."
+              className="flex-1 bg-black border border-terminal-dim px-2 py-1 text-[9px] text-terminal-green placeholder:text-terminal-dim focus:outline-none focus:border-terminal-green"
+            />
+            <button
+              onClick={sendMessage}
+              disabled={loading || !input.trim()}
+              className="px-2 py-1 text-[9px] bg-terminal-dim text-terminal-green hover:bg-terminal-dim/80 disabled:opacity-40 transition-colors"
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── Standard Bot Card (conservative / aggressive / fifteenMin) ──────────────
@@ -209,9 +385,11 @@ function StandardBotRow({ bot, label }: StandardBotProps) {
 interface GrokBotRowProps {
   bot: 'grok15min' | 'grokHourly';
   label: string;
+  memorySummary?: MemorySummaryData;
+  onMemoryRefresh?: () => void;
 }
 
-function GrokBotRow({ bot, label }: GrokBotRowProps) {
+function GrokBotRow({ bot, label, memorySummary, onMemoryRefresh }: GrokBotRowProps) {
   const [status, setStatus] = useState<GrokBotStatus>({ running: false, dailyPnL: 0, tradesCount: 0, lastDecisions: [] });
   const [config, setConfig] = useState<GrokBotConfig>({ enabled: false, capitalPerTrade: 3, confidenceThreshold: 57, maxDailyLoss: 0 });
   const [loading, setLoading] = useState(false);
@@ -384,13 +562,27 @@ function GrokBotRow({ bot, label }: GrokBotRowProps) {
           ))}
         </div>
       )}
+
+      {/* Memory + Chat insights panel */}
+      <BotInsightsPanel
+        botId={bot}
+        summary={memorySummary?.summary ?? ''}
+        updatedAt={memorySummary?.updatedAt ?? ''}
+        onMemoryRefresh={onMemoryRefresh ?? (() => {})}
+      />
     </div>
   );
 }
 
 // ─── Strike Sniper Card ───────────────────────────────────────────────────────
 
-function StrikeSniperRow() {
+function StrikeSniperRow({
+  memorySummary,
+  onMemoryRefresh,
+}: {
+  memorySummary?: MemorySummaryData;
+  onMemoryRefresh?: () => void;
+}) {
   const [status, setStatus] = useState<ArbScannerStatus>({
     running: false,
     dailyPnL: 0,
@@ -602,6 +794,14 @@ function StrikeSniperRow() {
           <div className="text-terminal-yellow mt-1 text-[9px]">⚠ {status.lastError}</div>
         )}
       </div>
+
+      {/* Memory + Chat insights panel */}
+      <BotInsightsPanel
+        botId="grokSwing"
+        summary={memorySummary?.summary ?? ''}
+        updatedAt={memorySummary?.updatedAt ?? ''}
+        onMemoryRefresh={onMemoryRefresh ?? (() => {})}
+      />
     </div>
   );
 }
@@ -609,6 +809,21 @@ function StrikeSniperRow() {
 // ─── Main Export ─────────────────────────────────────────────────────────────
 
 export default function BotControls() {
+  const [memorySummaries, setMemorySummaries] = useState<Record<string, MemorySummaryData>>({});
+
+  const fetchMemory = () => {
+    fetch('/api/bot/memory')
+      .then(res => res.json())
+      .then(data => setMemorySummaries(data))
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetchMemory();
+    const interval = setInterval(fetchMemory, 30_000);
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div className="terminal-panel">
       <div className="terminal-header">BOT CONTROLS</div>
@@ -616,9 +831,22 @@ export default function BotControls() {
         <StandardBotRow bot="conservative" label="Conservative Hourly Bot" />
         <StandardBotRow bot="aggressive" label="Aggressive Hourly Bot" />
         <StandardBotRow bot="fifteenMin" label="15-Minute Bot" />
-        <GrokBotRow bot="grok15min" label="Grok 15-Min AI" />
-        <GrokBotRow bot="grokHourly" label="Grok Hourly AI" />
-        <StrikeSniperRow />
+        <GrokBotRow
+          bot="grok15min"
+          label="Grok 15-Min AI"
+          memorySummary={memorySummaries['grok15min']}
+          onMemoryRefresh={fetchMemory}
+        />
+        <GrokBotRow
+          bot="grokHourly"
+          label="Grok Hourly AI"
+          memorySummary={memorySummaries['grokHourly']}
+          onMemoryRefresh={fetchMemory}
+        />
+        <StrikeSniperRow
+          memorySummary={memorySummaries['grokSwing']}
+          onMemoryRefresh={fetchMemory}
+        />
       </div>
     </div>
   );
