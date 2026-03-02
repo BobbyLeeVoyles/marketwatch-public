@@ -678,6 +678,47 @@ async function enterOtmPosition(
   }
 }
 
+/**
+ * Called when a sell order fails with "market not found".
+ * Refetches the market fresh to determine if it settled and logs the outcome.
+ * Returns true if the position was resolved (drop from surviving); false if it
+ * should be kept (genuine transient error).
+ */
+async function resolveAfterFailedSell(pos: OtmPosition, context: string): Promise<boolean> {
+  try {
+    const market = await getKalshiClient().getMarket(pos.ticker);
+    if (market.status === 'settled') {
+      const isWin = market.result === pos.side;
+      const exitPriceDollars = isWin ? 1.0 : 0.0;
+      const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, exitPriceDollars, 'settlement');
+      logTradeToFile({
+        id: pos.id,
+        timestamp: new Date(pos.entryTime).toISOString(),
+        strategy: 'grokHourly',
+        direction: pos.side,
+        entryPrice: pos.entryPriceCents / 100,
+        exitPrice: exitPriceDollars,
+        exitType: 'settlement',
+        contracts: pos.contracts,
+        netPnL: breakdown.netPnL,
+        won: isWin,
+        exitReason: `OTM settlement (${context})`,
+      });
+      console.log(`[GROK HOURLY OTM] Settled during ${context} | ${isWin ? 'WIN' : 'LOSS'} | ${pos.ticker}`);
+      setImmediate(() => {
+        updateOutcome('grokHourly', `${getHourKey()}-otm`, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+      });
+      return true;
+    }
+    // Market still open — genuine transient error, keep in surviving
+    return false;
+  } catch {
+    // Can't reach market at all — drop position to avoid infinite error loop
+    console.warn(`[GROK HOURLY OTM] Cannot resolve ${pos.ticker} after failed sell (${context}) — dropping position`);
+    return true;
+  }
+}
+
 async function handleOtmExits(minutesRemaining: number): Promise<void> {
   if (!botState || botState.otmPositions.length === 0) return;
 
@@ -748,8 +789,13 @@ async function handleOtmExits(minutesRemaining: number): Promise<void> {
             exitReason: `98¢ derisk: bid ${currentBid}¢`,
           });
         } catch (err) {
-          console.error('[GROK HOURLY OTM] 98¢ derisk failed:', err);
-          surviving.push(pos);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.toLowerCase().includes('market not found')) {
+            if (!await resolveAfterFailedSell(pos, '98¢ derisk')) surviving.push(pos);
+          } else {
+            console.error('[GROK HOURLY OTM] 98¢ derisk failed:', err);
+            surviving.push(pos);
+          }
         }
         continue;
       }
@@ -777,8 +823,13 @@ async function handleOtmExits(minutesRemaining: number): Promise<void> {
             updateOutcome('grokHourly', `${getHourKey()}-otm`, 'WIN', breakdown.netPnL);
           });
         } catch (err) {
-          console.error('[GROK HOURLY OTM] Profit take sell failed:', err);
-          surviving.push(pos);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.toLowerCase().includes('market not found')) {
+            if (!await resolveAfterFailedSell(pos, 'profit take')) surviving.push(pos);
+          } else {
+            console.error('[GROK HOURLY OTM] Profit take sell failed:', err);
+            surviving.push(pos);
+          }
         }
         continue;
       }
@@ -809,8 +860,13 @@ async function handleOtmExits(minutesRemaining: number): Promise<void> {
             updateOutcome('grokHourly', `${getHourKey()}-otm`, 'LOSS', breakdown.netPnL);
           });
         } catch (err) {
-          console.error('[GROK HOURLY OTM] Time cut sell failed:', err);
-          surviving.push(pos);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.toLowerCase().includes('market not found')) {
+            if (!await resolveAfterFailedSell(pos, 'time cut')) surviving.push(pos);
+          } else {
+            console.error('[GROK HOURLY OTM] Time cut sell failed:', err);
+            surviving.push(pos);
+          }
         }
         continue;
       }
@@ -888,7 +944,16 @@ async function handleOtmExits(minutesRemaining: number): Promise<void> {
           updateOutcome('grokHourly', `${getHourKey()}-otm`, breakdown.netPnL > 0 ? 'WIN' : 'LOSS', breakdown.netPnL);
         });
       } catch (err) {
-        console.error(`[GROK HOURLY OTM] Grok exit sell failed for ${pos.ticker}:`, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.toLowerCase().includes('market not found')) {
+          const resolved = await resolveAfterFailedSell(pos, 'Grok exit');
+          if (resolved) {
+            const idx = surviving.findIndex(s => s.id === pos.id);
+            if (idx !== -1) surviving.splice(idx, 1);
+          }
+        } else {
+          console.error(`[GROK HOURLY OTM] Grok exit sell failed for ${pos.ticker}:`, err);
+        }
       }
     }
   }
