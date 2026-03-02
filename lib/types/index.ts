@@ -224,6 +224,31 @@ export interface BotConfig {
     confidenceThreshold: number;
     capitalPerTrade: number;
     maxDailyLoss: number;
+    // OTM momentum lottery
+    otmEnabled?: boolean;
+    otmVelocityThreshold?: number;
+    otmMinAskCents?: number;
+    otmMaxAskCents?: number;
+    otmMinOtmDollars?: number;
+    otmMaxOtmDollars?: number;
+    otmCapitalPerTrade?: number;
+    otmEntryCooldownMin?: number;
+    otmMinMinutesLeft?: number;
+    otmProfitMultiple?: number;
+    otmCutLossThreshold?: number;
+    otmCutLossMinutesLeft?: number;
+    maxDirectionalAskCents?: number;  // max ask price for directional entries (default 30¢)
+    // OTM overnight throttle
+    otmMaxPerHour?: number;            // max OTM lottery entries per hourly window (default 2)
+    otmOvernightMultiplier?: number;   // multiply otmVelocityThreshold overnight (default 2.0)
+    overnightStartHour?: number;       // UTC hour overnight starts (default 0)
+    overnightEndHour?: number;         // UTC hour overnight ends (default 7)
+    // Market schedule filters
+    skipFivePmEst?: boolean;           // skip 5 PM EST markets (non-support strike prices)
+    // 9:30 AM EST market open straddle
+    marketOpenStraddleEnabled?: boolean;         // auto-straddle 10 AM contract before market open
+    marketOpenStraddleOtmDollars?: number;       // target OTM distance per side ($)
+    marketOpenStraddleCapitalPerSide?: number;   // $ per side of the straddle
   };
   arb: {
     enabled: boolean;
@@ -248,5 +273,30 @@ export interface BotConfig {
     // OTM spike hunter config
     spikeVelocityMultiplier: number; // OTM wakeup fires when |velocity| >= threshold × this
     maxOtmAskCents: number;          // max ask price for OTM spike candidates (¢)
+    // Mispricing trigger config
+    mispricingEnabled?: boolean;     // enable fair-value mispricing wakeup path
+    mispricingEdgeCents?: number;    // min edge (¢) to trigger mispricing wakeup
+    // Last-minute straddle snipe config
+    sniperEnabled?: boolean;         // enable 1¢ straddle snipe in last 1–3 min
+    sniperContracts?: number;        // baseline contract count for straddle snipe
+    sniperBankrollThreshold?: number; // bankroll $ above which size scales up
+    sniperBankrollPct?: number;      // fraction of bankroll to risk per straddle side
+    // Spread arb config (Paths C & D — hourly only)
+    spreadArbEnabled?: boolean;      // enable simultaneous spread arb and completion paths
+    spreadArbMinNetCents?: number;   // min net profit (¢) after fees to trigger spread arb
+    // OBI sniper config
+    obiSniperEnabled?: boolean;      // enable order-book-imbalance directional OTM sniper
+    obiSniperThreshold?: number;     // min bidPct or askPct to trigger (default 68)
+    obiMaxAskCents?: number;         // max ask price for OBI sniper candidates (¢) (default 3)
+    obiMinOtmDollars?: number;       // min OTM distance in $ (default 300)
+    obiMaxOtmDollars?: number;       // max OTM distance in $ (default 2000)
+    obiCapitalPerTrade?: number;     // $ per OBI snipe (default = capitalPerTrade)
+    obiSniperMaxPerHour?: number;    // max OBI sniper entries per hourly window (default 2)
+    // Overnight quiet mode (raises thresholds, does not block)
+    overnightEnabled?: boolean;      // enable overnight threshold multipliers (default true)
+    overnightStartHour?: number;     // UTC hour overnight starts (default 0)
+    overnightEndHour?: number;       // UTC hour overnight ends (default 7)
+    overnightVelocityMultiplier?: number; // multiply velocityThresholdPerMin overnight (default 2.0)
+    overnightObiMultiplier?: number;      // multiply obiSniperThreshold overnight (default 1.1)
   };
 }

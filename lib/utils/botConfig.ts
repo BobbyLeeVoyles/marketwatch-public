@@ -37,6 +37,15 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     confidenceThreshold: 57,
     capitalPerTrade: 3,
     maxDailyLoss: 10,
+    maxDirectionalAskCents: 30,
+    otmMaxPerHour: 2,               // max OTM lottery entries per hourly window
+    otmOvernightMultiplier: 2.0,    // multiply OTM velocity threshold overnight
+    overnightStartHour: 0,          // UTC midnight
+    overnightEndHour: 7,            // UTC 7am
+    skipFivePmEst: true,            // skip 5 PM EST markets (non-support strike prices)
+    marketOpenStraddleEnabled: true,         // auto-straddle 10 AM contract before 9:30 AM market open
+    marketOpenStraddleOtmDollars: 400,       // target OTM distance per side ($)
+    marketOpenStraddleCapitalPerSide: 2,     // $ per side of the straddle
   },
   arb: {
     enabled: false,
@@ -58,6 +67,20 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     minPriceEdgeCents: 8,           // grokFifteenMinBot: skip if abs(yes_ask - 50) < this
     spikeVelocityMultiplier: 2.0,   // OTM wakeup fires at velocity >= threshold × 2.0
     maxOtmAskCents: 15,             // only show Grok OTM contracts priced ≤ 15¢
+    spreadArbEnabled: true,          // enable spread arb Paths C (simultaneous) and D (completion)
+    spreadArbMinNetCents: 3,         // min net ¢ profit after fees for spread arb trigger
+    sniperEnabled: false,            // DISABLED: straddle sniper spend not tracked in daily P&L
+    obiSniperEnabled: true,          // enable OBI-triggered directional OTM sniper
+    obiSniperThreshold: 68,          // min bidPct/askPct to fire (68 = 2.1:1 imbalance)
+    obiMaxAskCents: 3,               // only buy OTM contracts priced ≤ 3¢
+    obiMinOtmDollars: 300,           // min $ OTM distance to qualify
+    obiMaxOtmDollars: 2000,          // max $ OTM distance (avoid hopeless deep OTM)
+    obiSniperMaxPerHour: 2,          // max OBI sniper entries per hourly window
+    overnightEnabled: true,          // raise thresholds overnight to filter noise
+    overnightStartHour: 0,           // UTC — midnight
+    overnightEndHour: 7,             // UTC — 7am (covers thin-liquidity Asian session)
+    overnightVelocityMultiplier: 2.0, // 150 → 300 $/min required overnight
+    overnightObiMultiplier: 1.1,     // 68% → ~75% OBI required overnight
   },
 };
 

@@ -8,7 +8,7 @@
  * Supports multi-bet per cycle (directional, straddle, breakout).
  */
 
-import { getPrice, fetchHourlyCandles, fetchFundingRate, fetchOrderBookImbalance, getVelocity } from './btcFeed';
+import { getPrice, fetchHourlyCandles, fetchFundingRate, getOBI, getOBIDelta, getVelocity } from './btcFeed';
 import { appendSession, updateOutcome, getMemorySummary } from '@/lib/ai/botMemory';
 import { getMarketCached, parseTickerSettlementTime, clearMarketCache } from '@/lib/kalshi/markets';
 import { placeOrder, cancelAllOrders } from './kalshiTrader';
@@ -16,11 +16,12 @@ import { runSpreadLadder } from './spreadLadder';
 import { readBotConfig } from '@/lib/utils/botConfig';
 import { logTradeToFile, recordBotOrderId } from './positionTracker';
 import { calculateKalshiFeeBreakdown } from '@/lib/utils/fees';
-import { getGrokDecision, getGrokMultiExitCheck } from '@/lib/ai/grokClient';
-import { buildHourlyPrompt, buildMultiExitPrompt } from '@/lib/ai/grokPrompts';
+import { getGrokDecision, getGrokMultiExitCheck, getGrokSwingEntry } from '@/lib/ai/grokClient';
+import { buildHourlyPrompt, buildMultiExitPrompt, buildSwingEntryPrompt } from '@/lib/ai/grokPrompts';
 import { checkConservativeSignal } from '@/lib/strategies/conservative';
 import { calculateIndicators } from '@/lib/utils/indicators';
 import { getKalshiClient } from '@/lib/kalshi/client';
+import { isExternallyClosed } from '@/lib/kalshi/reconcile';
 import { BotPosition } from '@/lib/kalshi/types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -39,6 +40,17 @@ interface GrokDecisionLog {
   ticker?: string;
 }
 
+interface OtmPosition {
+  id: string;
+  ticker: string;
+  side: 'yes' | 'no';
+  contracts: number;
+  entryPriceCents: number;   // ¢ paid per contract
+  entryTime: number;         // ms timestamp
+  btcPriceAtEntry: number;
+  orderId: string;
+}
+
 interface GrokHourlyBotState {
   running: boolean;
   intervalId?: NodeJS.Timeout;
@@ -53,6 +65,11 @@ interface GrokHourlyBotState {
   lastExitCheck: number;
   lastGrokCallTime: number; // timestamp of last entry Grok call (for cooldown)
   hardStopFailedTickers: Set<string>; // tickers where hard stop sell failed this session
+  otmPositions: OtmPosition[];
+  lastOtmEntryTime: number;
+  lastOtmExitCheck: number;
+  otmCountThisHour: number;       // OTM entries placed in current hourly window
+  marketOpenStraddled: boolean;   // market open straddle fired this hour
 }
 
 // Positions file can hold single BotPosition (other bots) or BotPosition[] (grokHourly)
@@ -60,6 +77,8 @@ type PositionsFile = Record<string, unknown>;
 
 let botState: GrokHourlyBotState | null = null;
 let loopRunning = false; // guard against concurrent setInterval ticks
+const RECONCILE_INTERVAL_MS = 5 * 60 * 1000;
+const legLastReconciled = new Map<string, number>(); // ticker → last reconciliation ms
 
 function getHourKey(): string {
   const now = new Date();
@@ -189,12 +208,65 @@ async function handleActivePositions(arbConfig: ReturnType<typeof readBotConfig>
         continue;
       }
 
+      // Manual-close reconciliation: check every 5 min if Kalshi is flat
       const now = Date.now();
+      const lastRecon = legLastReconciled.get(leg.ticker) ?? 0;
+      if (now - lastRecon > RECONCILE_INTERVAL_MS) {
+        legLastReconciled.set(leg.ticker, now);
+        const closed = await isExternallyClosed(leg.ticker, leg.side);
+        if (closed) {
+          const currentBidRecon = leg.side === 'yes' ? market.yes_bid : market.no_bid;
+          const exitPriceRecon = currentBidRecon / 100;
+          const breakdownRecon = calculateKalshiFeeBreakdown(leg.contracts, leg.entryPrice, exitPriceRecon, 'early');
+          console.log(`[GROK HOURLY] Manual close detected: ${leg.ticker} — logging and clearing position`);
+          logTradeToFile({
+            id: leg.orderId || `grokHourly-manual-${Date.now()}`,
+            timestamp: leg.entryTime,
+            strategy: 'grokHourly',
+            direction: leg.side,
+            entryPrice: leg.entryPrice,
+            exitPrice: exitPriceRecon,
+            exitType: 'early',
+            contracts: leg.contracts,
+            netPnL: breakdownRecon.netPnL,
+            won: breakdownRecon.netPnL > 0,
+            exitReason: 'Manual close (external)',
+          });
+          legLastReconciled.delete(leg.ticker);
+          continue; // don't add to survivingLegs
+        }
+      }
+
       const currentBid = leg.side === 'yes' ? market.yes_bid : market.no_bid;
       const currentAsk = leg.side === 'yes' ? market.yes_ask : market.no_ask;
       const winProb = currentBid > 0 && currentAsk > 0 ? (currentBid + currentAsk) / 2 : currentBid;
       const breakdown = calculateKalshiFeeBreakdown(leg.contracts, leg.entryPrice, currentBid / 100, 'early');
       const minutesRemaining = Math.max(0, (new Date(market.close_time).getTime() - now) / 60000);
+
+      // 98¢ derisk: lock in near-max value
+      if (currentBid >= 98) {
+        console.log(`[GROK HOURLY] 98¢ derisk: ${leg.ticker} bid ${currentBid}¢ — locking in near-max value`);
+        try {
+          await placeOrder('grokHourly', leg.ticker, leg.side, 'sell', leg.contracts, currentBid);
+          logTradeToFile({
+            id: leg.orderId || `grokHourly-${Date.now()}`,
+            timestamp: leg.entryTime,
+            strategy: 'grokHourly',
+            direction: leg.side,
+            entryPrice: leg.entryPrice,
+            exitPrice: currentBid / 100,
+            exitType: 'early',
+            contracts: leg.contracts,
+            netPnL: breakdown.netPnL,
+            won: breakdown.netPnL > 0,
+            exitReason: `98¢ derisk: bid ${currentBid}¢`,
+          });
+        } catch (err) {
+          console.error(`[GROK HOURLY] 98¢ derisk sell failed for ${leg.ticker}:`, err);
+          survivingLegs.push(leg);
+        }
+        continue;
+      }
 
       // Hard stop: win prob < 10% on any leg
       if (winProb < 10 && currentBid > 0) {
@@ -348,6 +420,485 @@ async function handleActivePositions(arbConfig: ReturnType<typeof readBotConfig>
   writeBotPositions(allPositions);
 }
 
+/**
+ * Market open straddle — fired once per hour on weekdays during UTC 14:20–14:50.
+ * Buys cheap OTM YES (above BTC) + NO (below BTC) on the 10 AM EST closing contract
+ * to capture the 9:30 AM stock market open volatility spike without a directional bet.
+ */
+async function enterMarketOpenStraddle(
+  btcPrice: number,
+  minutesRemaining: number,
+  config: ReturnType<typeof readBotConfig>,
+): Promise<void> {
+  if (!botState) return;
+  botState.marketOpenStraddled = true; // set immediately to prevent re-entry on next tick
+
+  const botConfig = config.grokHourly;
+  const otmDollars = botConfig.marketOpenStraddleOtmDollars ?? 400;
+  const capitalPerSide = botConfig.marketOpenStraddleCapitalPerSide ?? 2;
+  const maxAskCents = 20;
+
+  let allMarkets: Awaited<ReturnType<ReturnType<typeof getKalshiClient>['getMarkets']>> = [];
+  try {
+    const client = getKalshiClient();
+    const now = Date.now();
+    allMarkets = (await client.getMarkets('KXBTCD', 'open')).filter(m => {
+      const close = new Date(m.close_time).getTime();
+      return close > now && close <= now + 70 * 60 * 1000;
+    });
+  } catch (err) {
+    console.error('[GROK HOURLY] Market open straddle: failed to fetch markets', err);
+    return;
+  }
+
+  if (allMarkets.length === 0) {
+    console.log('[GROK HOURLY] Market open straddle: no 10 AM contracts available');
+    return;
+  }
+
+  const withStrike = allMarkets
+    .map(m => {
+      const match = m.ticker.match(/-T(\d+(?:\.\d+)?)$/);
+      const strike = match ? parseFloat(match[1]) : 0;
+      return { ...m, strike };
+    })
+    .filter(m => m.strike > 0);
+
+  // YES leg: closest strike above BTC by 70–200% of otmDollars
+  const yesCandidate = withStrike
+    .filter(m => {
+      const dist = m.strike - btcPrice;
+      return dist >= otmDollars * 0.7 && dist <= otmDollars * 2 &&
+        m.yes_ask > 0 && m.yes_ask <= maxAskCents;
+    })
+    .sort((a, b) => (a.strike - btcPrice) - (b.strike - btcPrice))[0];
+
+  // NO leg: closest strike below BTC by 70–200% of otmDollars
+  const noCandidate = withStrike
+    .filter(m => {
+      const dist = btcPrice - m.strike;
+      return dist >= otmDollars * 0.7 && dist <= otmDollars * 2 &&
+        m.no_ask > 0 && m.no_ask <= maxAskCents;
+    })
+    .sort((a, b) => (btcPrice - a.strike) - (btcPrice - b.strike))[0];
+
+  if (!yesCandidate && !noCandidate) {
+    console.log(`[GROK HOURLY] Market open straddle: no OTM candidates within $${otmDollars} of BTC $${btcPrice.toFixed(0)}`);
+    return;
+  }
+
+  const legs: Array<['yes' | 'no', typeof yesCandidate]> = [];
+  if (yesCandidate) legs.push(['yes', yesCandidate]);
+  if (noCandidate)  legs.push(['no',  noCandidate]);
+
+  for (const [side, candidate] of legs) {
+    if (!candidate) continue;
+    const askCents = side === 'yes' ? candidate.yes_ask : candidate.no_ask;
+    const contracts = Math.floor(capitalPerSide / (askCents / 100));
+    if (contracts < 1) continue;
+
+    try {
+      await placeOrder('grokHourly', candidate.ticker, side, 'buy', contracts, askCents);
+      const otmPos: OtmPosition = {
+        id: `mktopen-${side}-${Date.now()}`,
+        ticker: candidate.ticker,
+        side,
+        contracts,
+        entryPriceCents: askCents,
+        entryTime: Date.now(),
+        btcPriceAtEntry: btcPrice,
+        orderId: '',
+      };
+      botState.otmPositions.push(otmPos);
+      botState.otmCountThisHour++;
+      console.log(
+        `[GROK HOURLY] Market open straddle: ${side.toUpperCase()} ${candidate.ticker} ` +
+        `@ ${askCents}¢ × ${contracts} | strike $${candidate.strike} vs BTC $${btcPrice.toFixed(0)} | ${minutesRemaining}m left`
+      );
+    } catch (err) {
+      console.error(`[GROK HOURLY] Market open straddle ${side} order failed:`, err);
+    }
+  }
+
+  // Persist updated OTM positions
+  const allPos = readBotPositions();
+  (allPos as Record<string, unknown>).grokHourlyOtm = botState.otmPositions;
+  writeBotPositions(allPos);
+}
+
+async function enterOtmPosition(
+  btcPrice: number,
+  velocity60: number,
+  minutesRemaining: number,
+  config: ReturnType<typeof readBotConfig>,
+): Promise<void> {
+  if (!botState) return;
+
+  const botConfig = config.grokHourly;
+  const otmMinOtm = botConfig.otmMinOtmDollars ?? 300;
+  const otmMaxOtm = botConfig.otmMaxOtmDollars ?? 1200;
+  const otmMinAsk = botConfig.otmMinAskCents ?? 2;
+  const otmMaxAsk = botConfig.otmMaxAskCents ?? 20;
+  const capital = botConfig.otmCapitalPerTrade ?? 2;
+  const velocityDir = velocity60 > 0 ? 'up' : 'down';
+
+  let candidates: Array<{ ticker: string; strike: number; yesAsk: number; noAsk: number; fairYesPct: number }> = [];
+
+  try {
+    const client = getKalshiClient();
+    const now = Date.now();
+    const allMarkets = await client.getMarkets('KXBTCD', 'open');
+    candidates = allMarkets
+      .filter(m => {
+        const close = new Date(m.close_time).getTime();
+        if (close <= now || close > now + 70 * 60 * 1000) return false;
+        const match = m.ticker.match(/-T(\d+(?:\.\d+)?)$/);
+        const strike = match ? parseFloat(match[1]) : 0;
+        if (strike === 0) return false;
+        if (velocityDir === 'up') {
+          const dist = strike - btcPrice;
+          if (dist < otmMinOtm || dist > otmMaxOtm) return false;
+          if (m.yes_ask < otmMinAsk || m.yes_ask > otmMaxAsk) return false;
+        } else {
+          const dist = btcPrice - strike;
+          if (dist < otmMinOtm || dist > otmMaxOtm) return false;
+          if (m.no_ask < otmMinAsk || m.no_ask > otmMaxAsk) return false;
+        }
+        return true;
+      })
+      .map(m => {
+        const match = m.ticker.match(/-T(\d+(?:\.\d+)?)$/);
+        const strike = match ? parseFloat(match[1]) : 0;
+        const dist = Math.abs(strike - btcPrice);
+        const fairYesPct = Math.max(1, 50 - (dist / btcPrice * 1000));
+        return { ticker: m.ticker, strike, yesAsk: m.yes_ask, noAsk: m.no_ask, fairYesPct };
+      });
+  } catch (err) {
+    console.error('[GROK HOURLY OTM] Failed to fetch markets:', err);
+    return;
+  }
+
+  if (candidates.length === 0) {
+    console.log('[GROK HOURLY OTM] No OTM candidates found');
+    return;
+  }
+
+  const memoryContext = getMemorySummary('grokHourly');
+  const prompt = buildSwingEntryPrompt({
+    utcTime: new Date().toISOString(),
+    btcPrice,
+    velocity: velocity60,
+    velocityDirection: velocityDir,
+    atmBtcPrice: btcPrice,
+    atmDistance: 0,
+    minutesRemaining,
+    windowType: 'hourly',
+    strikes: candidates,
+    otmMode: true,
+    capitalPerTrade: capital,
+    memoryContext,
+  });
+
+  const decision = await getGrokSwingEntry(prompt, 'grokHourly-otm');
+  if (decision.action !== 'ENTER' || !decision.ticker) {
+    console.log(`[GROK HOURLY OTM] Grok SKIP: ${decision.reason}`);
+    return;
+  }
+
+  const chosen = candidates.find(c => c.ticker === decision.ticker);
+  if (!chosen) {
+    console.log(`[GROK HOURLY OTM] Ticker not in candidates: ${decision.ticker}`);
+    return;
+  }
+
+  const side = decision.side;
+  const askCents = side === 'yes' ? chosen.yesAsk : chosen.noAsk;
+  const contracts = Math.floor(capital / (askCents / 100));
+  if (contracts < 1) {
+    console.log(`[GROK HOURLY OTM] Contracts < 1 for ${chosen.ticker} at ${askCents}¢`);
+    return;
+  }
+
+  console.log(`[GROK HOURLY OTM] ENTRY | ${side.toUpperCase()} ${chosen.ticker} | ${askCents}¢ × ${contracts} | ${decision.reason}`);
+
+  try {
+    const arbConfig = { ...config.arb, ladderTargetDiscount: 3 };
+    const ladderResult = await runSpreadLadder({
+      ticker: chosen.ticker,
+      side,
+      mode: { type: 'entry', buyContracts: contracts },
+      config: arbConfig,
+      minutesRemaining,
+    });
+
+    let finalOrderId = '';
+    let finalEntryPriceCents: number;
+
+    if (ladderResult.buyPlaced && ladderResult.status !== 'accidental-fill') {
+      finalOrderId = ladderResult.buyOrderId ?? '';
+      finalEntryPriceCents = ladderResult.buyPriceCents;
+    } else {
+      await placeOrder('grokHourly', chosen.ticker, side, 'buy', contracts, askCents);
+      finalEntryPriceCents = askCents;
+    }
+
+    const otmPos: OtmPosition = {
+      id: `otm-${Date.now()}`,
+      ticker: chosen.ticker,
+      side,
+      contracts,
+      entryPriceCents: finalEntryPriceCents,
+      entryTime: Date.now(),
+      btcPriceAtEntry: btcPrice,
+      orderId: finalOrderId,
+    };
+
+    botState.otmPositions.push(otmPos);
+    botState.lastOtmEntryTime = Date.now();
+    botState.otmCountThisHour++;
+
+    const allPos = readBotPositions();
+    (allPos as Record<string, unknown>).grokHourlyOtm = botState.otmPositions;
+    writeBotPositions(allPos);
+
+    console.log(`[GROK HOURLY OTM] Position opened: ${side.toUpperCase()} ${chosen.ticker} @ ${finalEntryPriceCents}¢ × ${contracts}`);
+
+    const hourKey = getHourKey();
+    setImmediate(() => {
+      appendSession('grokHourly', {
+        windowKey: `${hourKey}-otm`,
+        timestamp: new Date().toISOString(),
+        decision: side.toUpperCase(),
+        reason: decision.reason.substring(0, 60),
+        context: { btcPrice, velocity: velocity60, obi: 0 },
+      });
+    });
+  } catch (err) {
+    console.error('[GROK HOURLY OTM] Order failed:', err);
+  }
+}
+
+async function handleOtmExits(minutesRemaining: number): Promise<void> {
+  if (!botState || botState.otmPositions.length === 0) return;
+
+  const config = readBotConfig();
+  const botConfig = config.grokHourly;
+  const profitMultiple = botConfig.otmProfitMultiple ?? 3;
+  const cutLossThreshold = botConfig.otmCutLossThreshold ?? 0.3;
+  const cutLossMinutesLeft = botConfig.otmCutLossMinutesLeft ?? 20;
+
+  const surviving: OtmPosition[] = [];
+  const legsForGrokCheck: Array<{ pos: OtmPosition; currentBid: number; winProb: number }> = [];
+  const btcPrice = getPrice();
+
+  for (const pos of botState.otmPositions) {
+    try {
+      const market = await getMarketCached(pos.ticker);
+
+      if (market.status === 'settled') {
+        const isWin = market.result === pos.side;
+        const exitPriceDollars = isWin ? 1.0 : 0.0;
+        const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, exitPriceDollars, 'settlement');
+        logTradeToFile({
+          id: pos.id,
+          timestamp: new Date(pos.entryTime).toISOString(),
+          strategy: 'grokHourly',
+          direction: pos.side,
+          entryPrice: pos.entryPriceCents / 100,
+          exitPrice: exitPriceDollars,
+          exitType: 'settlement',
+          contracts: pos.contracts,
+          netPnL: breakdown.netPnL,
+          won: isWin,
+          exitReason: `OTM settlement: ${isWin ? 'WIN' : 'LOSS'}`,
+        });
+        console.log(`[GROK HOURLY OTM] Settlement ${isWin ? 'WIN' : 'LOSS'} | ${pos.ticker}`);
+        setImmediate(() => {
+          updateOutcome('grokHourly', `${getHourKey()}-otm`, isWin ? 'WIN' : 'LOSS', breakdown.netPnL);
+        });
+        continue;
+      }
+
+      if (market.status === 'closed') {
+        surviving.push(pos);
+        continue;
+      }
+
+      const currentBid = pos.side === 'yes' ? market.yes_bid : market.no_bid;
+      const currentAsk = pos.side === 'yes' ? market.yes_ask : market.no_ask;
+      const winProb = currentBid > 0 && currentAsk > 0 ? (currentBid + currentAsk) / 2 : currentBid;
+
+      // 98¢ derisk: lock in near-max value
+      if (currentBid >= 98) {
+        console.log(`[GROK HOURLY OTM] 98¢ derisk | ${pos.ticker} | bid ${currentBid}¢`);
+        try {
+          await placeOrder('grokHourly', pos.ticker, pos.side, 'sell', pos.contracts, currentBid);
+          const breakdown98 = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, currentBid / 100, 'early');
+          logTradeToFile({
+            id: pos.id,
+            timestamp: new Date(pos.entryTime).toISOString(),
+            strategy: 'grokHourly',
+            direction: pos.side,
+            entryPrice: pos.entryPriceCents / 100,
+            exitPrice: currentBid / 100,
+            exitType: 'early',
+            contracts: pos.contracts,
+            netPnL: breakdown98.netPnL,
+            won: true,
+            exitReason: `98¢ derisk: bid ${currentBid}¢`,
+          });
+        } catch (err) {
+          console.error('[GROK HOURLY OTM] 98¢ derisk failed:', err);
+          surviving.push(pos);
+        }
+        continue;
+      }
+
+      // Rule 1: profit take at profitMultiple × entry
+      if (currentBid >= profitMultiple * pos.entryPriceCents) {
+        console.log(`[GROK HOURLY OTM] Profit take ${profitMultiple}x | ${pos.ticker} | bid ${currentBid}¢ vs entry ${pos.entryPriceCents}¢`);
+        try {
+          await placeOrder('grokHourly', pos.ticker, pos.side, 'sell', pos.contracts, currentBid);
+          const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, currentBid / 100, 'early');
+          logTradeToFile({
+            id: pos.id,
+            timestamp: new Date(pos.entryTime).toISOString(),
+            strategy: 'grokHourly',
+            direction: pos.side,
+            entryPrice: pos.entryPriceCents / 100,
+            exitPrice: currentBid / 100,
+            exitType: 'early',
+            contracts: pos.contracts,
+            netPnL: breakdown.netPnL,
+            won: true,
+            exitReason: `OTM profit take ${profitMultiple}x`,
+          });
+          setImmediate(() => {
+            updateOutcome('grokHourly', `${getHourKey()}-otm`, 'WIN', breakdown.netPnL);
+          });
+        } catch (err) {
+          console.error('[GROK HOURLY OTM] Profit take sell failed:', err);
+          surviving.push(pos);
+        }
+        continue;
+      }
+
+      // Rule 3: time-based cut loss
+      if (minutesRemaining < cutLossMinutesLeft && currentBid < cutLossThreshold * pos.entryPriceCents) {
+        console.log(`[GROK HOURLY OTM] Time-based cut | ${pos.ticker} | ${minutesRemaining.toFixed(1)}m left | bid ${currentBid}¢`);
+        try {
+          if (currentBid > 0) {
+            await placeOrder('grokHourly', pos.ticker, pos.side, 'sell', pos.contracts, currentBid);
+          }
+          const exitPriceDollars = currentBid > 0 ? currentBid / 100 : 0;
+          const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, exitPriceDollars, 'early');
+          logTradeToFile({
+            id: pos.id,
+            timestamp: new Date(pos.entryTime).toISOString(),
+            strategy: 'grokHourly',
+            direction: pos.side,
+            entryPrice: pos.entryPriceCents / 100,
+            exitPrice: exitPriceDollars,
+            exitType: 'early',
+            contracts: pos.contracts,
+            netPnL: breakdown.netPnL,
+            won: false,
+            exitReason: `OTM time cut: <${cutLossMinutesLeft}m left`,
+          });
+          setImmediate(() => {
+            updateOutcome('grokHourly', `${getHourKey()}-otm`, 'LOSS', breakdown.netPnL);
+          });
+        } catch (err) {
+          console.error('[GROK HOURLY OTM] Time cut sell failed:', err);
+          surviving.push(pos);
+        }
+        continue;
+      }
+
+      // Candidate for Grok momentum-stall check (Rule 2)
+      surviving.push(pos);
+      legsForGrokCheck.push({ pos, currentBid, winProb });
+
+    } catch (err) {
+      console.error(`[GROK HOURLY OTM] Error monitoring ${pos.ticker}:`, err);
+      surviving.push(pos);
+    }
+  }
+
+  // Rule 2: Grok momentum-stall check every 3 minutes
+  const now = Date.now();
+  if (legsForGrokCheck.length > 0 && (now - botState.lastOtmExitCheck) >= EXIT_CHECK_INTERVAL_MS) {
+    botState.lastOtmExitCheck = now;
+
+    const velocity30 = getVelocity(30_000);
+    const velocity60 = getVelocity(60_000);
+    const velocityTrend: 'accelerating' | 'stable' | 'decelerating' =
+      velocity60 === 0 ? 'stable' :
+      Math.abs(velocity30) >= Math.abs(velocity60) * 1.2 ? 'accelerating' :
+      Math.abs(velocity30) <= Math.abs(velocity60) * 0.5 ? 'decelerating' : 'stable';
+
+    const exitPrompt = buildMultiExitPrompt({
+      legs: legsForGrokCheck.map(({ pos, currentBid, winProb }) => ({
+        ticker: pos.ticker,
+        side: pos.side,
+        contracts: pos.contracts,
+        entryPrice: pos.entryPriceCents / 100,
+        unrealizedPnL: calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, currentBid / 100, 'early').netPnL,
+        currentBid,
+        winProb,
+        minsRemaining: minutesRemaining,
+      })),
+      btcPrice,
+      suggestedRisk: 'high',
+      velocityTrend,
+    });
+
+    const exitCheck = await getGrokMultiExitCheck(exitPrompt, 'grokHourly-otm');
+    console.log(`[GROK HOURLY OTM] Multi-exit check: ${JSON.stringify(exitCheck.exits)}`);
+
+    for (const exitDecision of exitCheck.exits) {
+      if (exitDecision.action !== 'EXIT') continue;
+
+      const legInfo = legsForGrokCheck.find(l => l.pos.ticker === exitDecision.ticker);
+      if (!legInfo) continue;
+
+      const { pos, currentBid } = legInfo;
+      if (currentBid <= 0) continue;
+
+      try {
+        await placeOrder('grokHourly', pos.ticker, pos.side, 'sell', pos.contracts, currentBid);
+        const breakdown = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPriceCents / 100, currentBid / 100, 'early');
+        logTradeToFile({
+          id: pos.id,
+          timestamp: new Date(pos.entryTime).toISOString(),
+          strategy: 'grokHourly',
+          direction: pos.side,
+          entryPrice: pos.entryPriceCents / 100,
+          exitPrice: currentBid / 100,
+          exitType: 'early',
+          contracts: pos.contracts,
+          netPnL: breakdown.netPnL,
+          won: breakdown.netPnL > 0,
+          exitReason: 'OTM Grok momentum-stall exit',
+        });
+        console.log(`[GROK HOURLY OTM] Grok exit: ${pos.ticker} | P&L: $${breakdown.netPnL.toFixed(2)}`);
+        const idx = surviving.findIndex(s => s.id === pos.id);
+        if (idx !== -1) surviving.splice(idx, 1);
+        setImmediate(() => {
+          updateOutcome('grokHourly', `${getHourKey()}-otm`, breakdown.netPnL > 0 ? 'WIN' : 'LOSS', breakdown.netPnL);
+        });
+      } catch (err) {
+        console.error(`[GROK HOURLY OTM] Grok exit sell failed for ${pos.ticker}:`, err);
+      }
+    }
+  }
+
+  botState.otmPositions = surviving;
+  const allPos = readBotPositions();
+  (allPos as Record<string, unknown>).grokHourlyOtm = surviving;
+  writeBotPositions(allPos);
+}
+
 async function grokHourlyBotLoop(): Promise<void> {
   if (!botState?.running) return;
   if (loopRunning) return; // previous tick still running (Grok API in progress)
@@ -380,6 +931,8 @@ async function grokHourlyBotLoop(): Promise<void> {
       botState.currentHourKey = hourKey;
       botState.capitalDeployedThisHour = 0;
       botState.hardStopFailedTickers.clear();
+      botState.otmCountThisHour = 0;
+      botState.marketOpenStraddled = false;
       // positions already cleared by settlement; no forced clear needed
     }
 
@@ -391,9 +944,28 @@ async function grokHourlyBotLoop(): Promise<void> {
       botState.positions = diskLegs;
     }
 
-    // Monitor active positions
+    // Compute minutesRemaining early (needed for OTM monitoring and entry trigger)
+    const nowH = new Date();
+    const minutesInHour = nowH.getMinutes();
+    const minutesRemaining = 60 - minutesInHour;
+    const utcHour = nowH.getUTCHours();
+    const utcMin = nowH.getUTCMinutes();
+    const isWeekday = nowH.getUTCDay() >= 1 && nowH.getUTCDay() <= 5;
+
+    // Monitor active ATM positions
     if (botState.positions.length > 0) {
       await handleActivePositions(config.arb);
+    }
+
+    // Monitor active OTM positions (always, even with < 10 min remaining)
+    if (botState.otmPositions.length > 0) {
+      await handleOtmExits(minutesRemaining);
+    }
+
+    // Skip 5 PM EST markets: strike prices sit at 500-dollar non-support intervals
+    // 5 PM EST = 22:00 UTC; the evaluation hour for those contracts is UTC 21
+    if ((botConfig.skipFivePmEst ?? true) && utcHour === 21) {
+      return;
     }
 
     // Capital gate (replaces tradedThisHour guard)
@@ -401,12 +973,40 @@ async function grokHourlyBotLoop(): Promise<void> {
     if (capitalRemaining < 1.00) return; // budget exhausted
 
     // Stop accepting new entries when < 10 minutes remain in the hour
-    const nowH = new Date();
-    const minutesInHour = nowH.getMinutes();
-    const minutesRemaining = 60 - minutesInHour;
     if (minutesRemaining < 10) return;
 
-    // Cooldown between Grok calls
+    // 9:30 AM EST market open straddle (weekdays, UTC 14:20–14:50)
+    // Buy cheap OTM YES + NO on the 10 AM closing contract to capture the volatility
+    // spike without needing directional conviction.
+    if (
+      (botConfig.marketOpenStraddleEnabled ?? true) &&
+      isWeekday && utcHour === 14 && utcMin >= 20 && utcMin <= 50 &&
+      !botState.marketOpenStraddled
+    ) {
+      await enterMarketOpenStraddle(btcPrice, minutesRemaining, config);
+    }
+
+    // OTM entry trigger (independent of ATM cooldown)
+    const velocity60 = getVelocity(60_000);
+    const otmEnabled = botConfig.otmEnabled ?? false;
+    const otmCooldownOk = Date.now() - botState.lastOtmEntryTime >= (botConfig.otmEntryCooldownMin ?? 15) * 60_000;
+    const otmTimeOk = minutesRemaining >= (botConfig.otmMinMinutesLeft ?? 15);
+    const noOtmInDirection = !botState.otmPositions.some(p =>
+      (velocity60 > 0 && p.side === 'yes') || (velocity60 < 0 && p.side === 'no'),
+    );
+    const otmHourUtc = new Date().getUTCHours();
+    const otmIsOvernight = otmHourUtc >= (botConfig.overnightStartHour ?? 0) &&
+      otmHourUtc < (botConfig.overnightEndHour ?? 7);
+    const effectiveOtmVelThreshold = (botConfig.otmVelocityThreshold ?? 75) *
+      (otmIsOvernight ? (botConfig.otmOvernightMultiplier ?? 2.0) : 1.0);
+    const otmCapOk = botState.otmCountThisHour < (botConfig.otmMaxPerHour ?? 2);
+
+    if (otmEnabled && Math.abs(velocity60) >= effectiveOtmVelThreshold &&
+        otmCooldownOk && otmTimeOk && noOtmInDirection && otmCapOk) {
+      await enterOtmPosition(btcPrice, velocity60, minutesRemaining, config);
+    }
+
+    // Cooldown between ATM Grok calls
     if (Date.now() - botState.lastGrokCallTime < GROK_ENTRY_COOLDOWN_MS) return;
 
     const hourlyCandles = await fetchHourlyCandles();
@@ -440,10 +1040,8 @@ async function grokHourlyBotLoop(): Promise<void> {
     }
 
     // Get supporting data
-    const [fundingRate, obi] = await Promise.all([
-      fetchFundingRate(),
-      fetchOrderBookImbalance(),
-    ]);
+    const fundingRate = await fetchFundingRate();
+    const obi = getOBI();
 
     const velocity = getVelocity();
     const memoryContext = getMemorySummary('grokHourly');
@@ -498,6 +1096,7 @@ async function grokHourlyBotLoop(): Promise<void> {
       })),
       velocity,
       memoryContext,
+      obiTrend: getOBIDelta(),
     });
 
     botState.lastGrokCallTime = Date.now();
@@ -561,6 +1160,7 @@ async function grokHourlyBotLoop(): Promise<void> {
         decision: decision.bets.length > 0 ? decision.bets[0].side.toUpperCase() : 'ENTER',
         reason: decision.reason.substring(0, 60),
         context: { btcPrice, velocity, obi: obi?.imbalance ?? 0 },
+        grokConfidence: decision.confidence,
       });
     });
 
@@ -576,8 +1176,14 @@ async function grokHourlyBotLoop(): Promise<void> {
       }
 
       const askCents = bet.side === 'yes' ? market.yesAsk : market.noAsk;
-      if (askCents <= 0 || askCents > 45) {
-        console.log(`[GROK HOURLY] Ask out of range for ${bet.ticker}: ${askCents}¢ (must be 1–45¢) — skipping bet`);
+      const maxAsk = botConfig.maxDirectionalAskCents ?? 30;
+      if (askCents <= 0 || askCents > maxAsk) {
+        console.log(`[GROK HOURLY] Ask ${askCents}¢ out of range (max ${maxAsk}¢) — skipping bet`);
+        continue;
+      }
+
+      if (askCents < 5) {
+        console.log(`[GROK HOURLY] Entropy: ask ${askCents}¢ too low — market near-certain, skipping leg`);
         continue;
       }
 
@@ -682,6 +1288,9 @@ export function startGrokHourlyBot(): void {
   // Pre-load any existing positions so monitoring resumes immediately on restart.
   const existingPositions = readBotPositions();
   const existingLegs = readGrokHourlyLegs(existingPositions);
+  const existingOtmPositions: OtmPosition[] = Array.isArray((existingPositions as Record<string, unknown>).grokHourlyOtm)
+    ? (existingPositions as Record<string, unknown>).grokHourlyOtm as OtmPosition[]
+    : [];
 
   const currentHourKey = getHourKey();
   const meta = (existingPositions as any).grokHourlyMeta;
@@ -704,6 +1313,11 @@ export function startGrokHourlyBot(): void {
     lastExitCheck: 0,
     lastGrokCallTime: metaForHour?.lastGrokCallTime ?? 0,
     hardStopFailedTickers: new Set<string>(),
+    otmPositions: existingOtmPositions,
+    lastOtmEntryTime: 0,
+    lastOtmExitCheck: 0,
+    otmCountThisHour: 0,
+    marketOpenStraddled: false,
   };
 
   if (existingLegs.length > 0) {

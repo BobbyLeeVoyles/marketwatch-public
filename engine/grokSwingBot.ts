@@ -18,7 +18,8 @@
  */
 
 import { getKalshiClient } from '@/lib/kalshi/client';
-import { getPrice, getVelocity } from './btcFeed';
+import { isExternallyClosed } from '@/lib/kalshi/reconcile';
+import { getPrice, getVelocity, getOBI, getOBIDelta } from './btcFeed';
 import { readBotConfig } from '@/lib/utils/botConfig';
 import { appendSession, updateOutcome, getMemorySummary } from '@/lib/ai/botMemory';
 import { logTradeToFile, openTradeLifecycle, closeTradeLifecycle } from './positionTracker';
@@ -27,17 +28,35 @@ import { placeOrder } from './kalshiTrader';
 import { runSpreadLadder } from './spreadLadder';
 import { getGrokSwingEntry, getGrokMultiExitCheck } from '@/lib/ai/grokClient';
 import { buildSwingEntryPrompt, buildMultiExitPrompt } from '@/lib/ai/grokPrompts';
-import { calculateKalshiFeeBreakdown } from '@/lib/utils/fees';
-import { BotPosition } from '@/lib/kalshi/types';
+import { calculateKalshiFeeBreakdown, calculateKalshiFee } from '@/lib/utils/fees';
+import { BotPosition, KalshiMarket } from '@/lib/kalshi/types';
 import * as fs from 'fs';
 import * as path from 'path';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const LOOP_INTERVAL_MS = 3_000;            // 3-second main loop
-const SIGNAL_WAKEUP_COOLDOWN_MS = 90_000;  // min 90s between Grok wakeup calls
-const EXIT_CHECK_INTERVAL_MS = 3 * 60_000; // Grok exit check every 3 minutes
+const LOOP_INTERVAL_MS = 3_000;                // 3-second main loop
+const RECONCILE_INTERVAL_MS = 5 * 60 * 1000;  // manual-close reconciliation every 5 min
+const VELOCITY_WAKEUP_COOLDOWN_MS = 90_000;   // min 90s between velocity-triggered wakeups
+const MISPRICING_WAKEUP_COOLDOWN_MS = 45_000; // min 45s between mispricing-triggered wakeups
+const EXIT_CHECK_INTERVAL_MS = 3 * 60_000;    // Grok exit check every 3 minutes
+const MARKETS_CACHE_TTL_MS = 30_000;           // refresh market list every 30s for mispricing check
 const BOT_POSITIONS_FILE = path.resolve('./data/bot-positions.json');
+
+const SPREAD_ARB_COOLDOWN_MS = 30_000;             // 30s between simultaneous spread arb entries
+const OBI_SNIPER_COOLDOWN_MS = 30_000;             // 30s between OBI sniper entries
+
+// Per-position reconciliation timestamps (posKey → last check ms)
+const posLastReconciled = new Map<string, number>();
+
+// Spread arb Path C — module-level cooldown state
+let lastSpreadArbTime = 0;
+// OBI sniper — module-level cooldown state
+let lastObiSniperTime = 0;
+
+// Black-Scholes sigma constants (approx annualised vol / sqrt(window_minutes))
+const SIGMA_15 = 0.003 / Math.sqrt(15);
+const SIGMA_HOURLY = 0.005 / Math.sqrt(60);
 
 // ── Math helpers (copied from strikeSniper) ───────────────────────────────────
 
@@ -73,6 +92,52 @@ function get15MinWindowKey(): string {
 function getHourlyWindowKey(): string {
   const now = new Date();
   return `${now.toISOString().split('T')[0]}-${now.getUTCHours()}`;
+}
+
+// ── Market snapshot cache (for mispricing check in main loop) ─────────────────
+
+interface StrikeMarketEntry {
+  market: KalshiMarket;
+  strike: number;
+}
+
+interface MarketsSnapshot {
+  fifteenMin: StrikeMarketEntry[];
+  hourly: StrikeMarketEntry[];
+  updatedAt: number;
+}
+
+let marketsSnapshot: MarketsSnapshot = { fifteenMin: [], hourly: [], updatedAt: 0 };
+
+async function maybeRefreshMarketsSnapshot(btcPrice: number): Promise<void> {
+  if (Date.now() - marketsSnapshot.updatedAt < MARKETS_CACHE_TTL_MS) return;
+  const client = getKalshiClient();
+  const now = Date.now();
+  try {
+    const [raw15, raw1h] = await Promise.all([
+      client.getMarkets('KXBTC15M', 'open'),
+      client.getMarkets('KXBTCD', 'open'),
+    ]);
+    marketsSnapshot = {
+      fifteenMin: raw15
+        .filter(m => {
+          const s = parseStrikeFromTicker(m.ticker);
+          const close = new Date(m.close_time).getTime();
+          return s !== undefined && Math.abs(s - btcPrice) <= 1000
+            && close > now && close <= now + 16 * 60_000;
+        })
+        .map(m => ({ market: m, strike: parseStrikeFromTicker(m.ticker)! })),
+      hourly: raw1h
+        .filter(m => {
+          const s = parseStrikeFromTicker(m.ticker);
+          const close = new Date(m.close_time).getTime();
+          return s !== undefined && Math.abs(s - btcPrice) <= 1000
+            && close > now && close <= now + 90 * 60_000;
+        })
+        .map(m => ({ market: m, strike: parseStrikeFromTicker(m.ticker)! })),
+      updatedAt: now,
+    };
+  } catch { /* keep stale cache on error */ }
 }
 
 // ── Position persistence ───────────────────────────────────────────────────────
@@ -116,6 +181,119 @@ function calculateDailyPnL(): { pnl: number; count: number } {
 }
 
 
+// ── Spread arb helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Path C: Scan adjacent strike pairs for a simultaneous spread entry.
+ * Returns the best adjacent pair where YES[lower] + NO[upper] < $1 - fees - minNetProfitCents.
+ */
+function findSpreadViolation(
+  markets: StrikeMarketEntry[],
+  minNetProfitCents: number,
+): { lower: StrikeMarketEntry; upper: StrikeMarketEntry; netProfitCents: number } | null {
+  const sorted = [...markets].sort((a, b) => a.strike - b.strike);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const lower = sorted[i];
+    const upper = sorted[i + 1];
+    const yesAsk = lower.market.yes_ask ?? 0;
+    const noAsk  = upper.market.no_ask  ?? 0;
+    if (yesAsk <= 0 || noAsk <= 0) continue;
+    const sumCents = yesAsk + noAsk;
+    // Fee for one contract of each leg (in cents)
+    const feeCents = (calculateKalshiFee(1, yesAsk) + calculateKalshiFee(1, noAsk)) * 100;
+    const netProfit = 100 - sumCents - feeCents;
+    if (netProfit >= minNetProfitCents) return { lower, upper, netProfitCents: netProfit };
+  }
+  return null;
+}
+
+interface AdjacentCompletionTarget {
+  market: KalshiMarket;
+  completionSide: 'yes' | 'no';
+  askCents: number;
+  netProfitCents: number;
+}
+
+/**
+ * Path D: Given an existing directional position, check whether the adjacent
+ * strike's opposite side is cheap enough to convert the position into a
+ * guaranteed spread (combined cost < $1 - fees - minNetProfitCents).
+ *
+ * YES position on strike K → look for cheap NO on K+1 (next higher strike)
+ * NO  position on strike K → look for cheap YES on K-1 (next lower strike)
+ *
+ * `entryPriceCents` is the original entry price (already paid); net profit is
+ * the incremental gain from completing the spread.
+ */
+function findAdjacentForCompletion(
+  pos: BotPosition,
+  markets: StrikeMarketEntry[],
+  entryPriceCents: number,
+  minNetProfitCents: number,
+): AdjacentCompletionTarget | null {
+  if (!pos.strike) return null;
+  const sorted = [...markets].sort((a, b) => a.strike - b.strike);
+  const posIdx = sorted.findIndex(m => m.strike === pos.strike);
+  if (posIdx === -1) return null;
+
+  if (pos.side === 'yes') {
+    // Existing YES on lower strike → complete with NO on next higher strike
+    const upper = sorted[posIdx + 1];
+    if (!upper) return null;
+    const noAsk = upper.market.no_ask ?? 0;
+    if (noAsk <= 0) return null;
+    const feeCents = calculateKalshiFee(1, noAsk) * 100;
+    const netProfit = 100 - entryPriceCents - noAsk - feeCents;
+    if (netProfit >= minNetProfitCents) {
+      return { market: upper.market, completionSide: 'no', askCents: noAsk, netProfitCents: netProfit };
+    }
+  } else {
+    // Existing NO on upper strike → complete with YES on next lower strike
+    const lower = sorted[posIdx - 1];
+    if (!lower) return null;
+    const yesAsk = lower.market.yes_ask ?? 0;
+    if (yesAsk <= 0) return null;
+    const feeCents = calculateKalshiFee(1, yesAsk) * 100;
+    const netProfit = 100 - entryPriceCents - yesAsk - feeCents;
+    if (netProfit >= minNetProfitCents) {
+      return { market: lower.market, completionSide: 'yes', askCents: yesAsk, netProfitCents: netProfit };
+    }
+  }
+  return null;
+}
+
+/**
+ * Path C execution: buy both legs of a guaranteed spread simultaneously.
+ * No active exit management needed — both legs will settle to a combined $1+ payout.
+ * If leg 1 succeeds but leg 2 fails, logs a warning (operator should inspect Kalshi).
+ */
+async function executeSimultaneousSpread(
+  v: { lower: StrikeMarketEntry; upper: StrikeMarketEntry; netProfitCents: number },
+  arbConfig: ReturnType<typeof readBotConfig>['arb'],
+): Promise<void> {
+  const yesAsk = v.lower.market.yes_ask!;
+  const noAsk  = v.upper.market.no_ask!;
+  const contracts = Math.max(1, Math.floor(arbConfig.capitalPerTrade / ((yesAsk + noAsk) / 100)));
+
+  console.log(
+    `[SWING] SPREAD ARB (Path C) | YES ${v.lower.market.ticker} @ ${yesAsk}¢ + ` +
+    `NO ${v.upper.market.ticker} @ ${noAsk}¢ = ${yesAsk + noAsk}¢ total | ` +
+    `net: +${v.netProfitCents.toFixed(1)}¢ | ${contracts} contracts`
+  );
+
+  try {
+    await placeOrder('arb', v.lower.market.ticker, 'yes', 'buy', contracts, yesAsk);
+  } catch (err) {
+    console.error('[SWING] Spread arb leg 1 (YES) failed:', err instanceof Error ? err.message : err);
+    return;
+  }
+  try {
+    await placeOrder('arb', v.upper.market.ticker, 'no', 'buy', contracts, noAsk);
+  } catch (err) {
+    console.error('[SWING] Spread arb leg 2 (NO) failed — WARNING: YES leg may be open on Kalshi:', err instanceof Error ? err.message : err);
+  }
+}
+
 // ── State ──────────────────────────────────────────────────────────────────────
 
 interface GrokSwingBotState {
@@ -124,18 +302,30 @@ interface GrokSwingBotState {
 
   // 15-min tracking
   fifteenMinPosition: BotPosition | null;
-  tradedThisWindow: boolean;
   currentWindowKey: string;
   windowOpenBtcPrice: number;
 
   // Hourly tracking
   hourlyPosition: BotPosition | null;
-  tradedThisHourlyWindow: boolean;
   currentHourlyWindowKey: string;
   hourlyWindowOpenBtcPrice: number;
 
-  lastSignalWakeupTime: number;  // cooldown: min 90s between wakeups
+  // OBI sniper per-hour budget
+  obiSniperCountThisHour: number;    // entries fired in current hourly window
+
+  // Per-path wakeup cooldowns (independent — don't block each other)
+  lastVelocityWakeupTime: number;    // 90s cooldown for momentum/OTM paths
+  lastMispricingWakeupTime: number;  // 45s cooldown for mispricing path
+
   lastGrokExitCheckTime: number; // normal 3-min exit check cycle
+
+  // Spread arb Path D state
+  spreadCompletedForHourly: boolean;  // prevent double-completion per hourly window
+
+  // Last-minute straddle snipe state
+  snipeOrderYesId: string | null;
+  snipeOrderNoId: string | null;
+  snipeTicker: string;
 
   dailyPnL: number;
   tradesCount: number;
@@ -164,10 +354,14 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
   const toCheck: Array<{ posKey: 'arb' | 'arb-hourly'; position: BotPosition; windowOpenBtcPrice: number; windowType: '15min' | 'hourly' }> = [];
 
   if (botState.fifteenMinPosition) {
-    toCheck.push({ posKey: 'arb', position: botState.fifteenMinPosition, windowOpenBtcPrice: botState.windowOpenBtcPrice, windowType: '15min' });
+    const p15 = botState.fifteenMinPosition;
+    const wob15 = p15.windowOpenBtcPrice ?? (botState.windowOpenBtcPrice > 0 ? botState.windowOpenBtcPrice : btcPrice);
+    toCheck.push({ posKey: 'arb', position: p15, windowOpenBtcPrice: wob15, windowType: '15min' });
   }
   if (botState.hourlyPosition) {
-    toCheck.push({ posKey: 'arb-hourly', position: botState.hourlyPosition, windowOpenBtcPrice: botState.hourlyWindowOpenBtcPrice, windowType: 'hourly' });
+    const ph = botState.hourlyPosition;
+    const wobH = ph.windowOpenBtcPrice ?? (botState.hourlyWindowOpenBtcPrice > 0 ? botState.hourlyWindowOpenBtcPrice : btcPrice);
+    toCheck.push({ posKey: 'arb-hourly', position: ph, windowOpenBtcPrice: wobH, windowType: 'hourly' });
   }
 
   const surviving: Array<{ posKey: 'arb' | 'arb-hourly'; position: BotPosition; windowOpenBtcPrice: number; windowType: '15min' | 'hourly' }> = [];
@@ -231,7 +425,36 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
         continue;
       }
 
+      // Manual-close reconciliation: check every 5 min if Kalshi is flat
       const now = Date.now();
+      const lastRecon = posLastReconciled.get(posKey) ?? 0;
+      if (now - lastRecon > RECONCILE_INTERVAL_MS) {
+        posLastReconciled.set(posKey, now);
+        const closed = await isExternallyClosed(pos.ticker, pos.side);
+        if (closed) {
+          const currentBidRecon = pos.side === 'yes' ? market.yes_bid : market.no_bid;
+          const exitPriceRecon = currentBidRecon / 100;
+          const breakdownRecon = calculateKalshiFeeBreakdown(pos.contracts, pos.entryPrice, exitPriceRecon, 'early');
+          console.log(`[SWING] Manual close detected: ${pos.ticker} — logging and clearing position`);
+          logTradeToFile({
+            id: pos.orderId || `arb-manual-${Date.now()}`,
+            timestamp: pos.entryTime,
+            strategy: 'arb' as any,
+            direction: pos.side,
+            strike: pos.strike,
+            entryPrice: pos.entryPrice,
+            exitPrice: exitPriceRecon,
+            exitType: 'early',
+            contracts: pos.contracts,
+            netPnL: breakdownRecon.netPnL,
+            won: breakdownRecon.netPnL > 0,
+            exitReason: 'Manual close (external)',
+          });
+          posLastReconciled.delete(posKey);
+          continue; // don't add to surviving
+        }
+      }
+
       const currentBid = pos.side === 'yes' ? market.yes_bid : market.no_bid;
       const currentAsk = pos.side === 'yes' ? market.yes_ask : market.no_ask;
       const winProb = currentBid > 0 && currentAsk > 0 ? (currentBid + currentAsk) / 2 : currentBid;
@@ -251,7 +474,9 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
 
       // Evaluate exit conditions
       let exitReason: string | null = null;
-      if (winProb < 10 && currentBid > 0) {
+      if (currentBid >= 98) {
+        exitReason = `Bid ${currentBid}¢ ≥ 98¢ — derisking`;
+      } else if (winProb < 10 && currentBid > 0) {
         exitReason = `Hard stop: win prob ${winProb.toFixed(1)}%`;
       } else if (captureRate >= arbConfig.exitCaptureRate) {
         exitReason = `Capture rate ${(captureRate * 100).toFixed(1)}% (target ${(arbConfig.exitCaptureRate * 100).toFixed(0)}%)`;
@@ -307,6 +532,29 @@ async function handleActivePositions(btcPrice: number, arbConfig: ReturnType<typ
           surviving.push(item);
         }
         continue;
+      }
+
+      // Spread completion (Path D): convert directional bet to guaranteed profit (hourly only)
+      if (
+        (arbConfig.spreadArbEnabled ?? true) &&
+        item.windowType === 'hourly' &&
+        !botState.spreadCompletedForHourly
+      ) {
+        const spreadMinNetCents = arbConfig.spreadArbMinNetCents ?? 3;
+        const adjacent = findAdjacentForCompletion(pos, marketsSnapshot.hourly, pos.entryPrice * 100, spreadMinNetCents);
+        if (adjacent) {
+          console.log(
+            `[SWING] Spread completion (Path D): ${pos.ticker} (${pos.side} @ ${(pos.entryPrice * 100).toFixed(0)}¢) + ` +
+            `${adjacent.market.ticker} (${adjacent.completionSide} @ ${adjacent.askCents}¢) ` +
+            `= ${(pos.entryPrice * 100 + adjacent.askCents).toFixed(0)}¢ total | net: +${adjacent.netProfitCents.toFixed(1)}¢`
+          );
+          try {
+            await placeOrder('arb', adjacent.market.ticker, adjacent.completionSide, 'buy', pos.contracts, adjacent.askCents);
+            botState.spreadCompletedForHourly = true;
+          } catch (err) {
+            console.error('[SWING] Spread completion failed:', err instanceof Error ? err.message : err);
+          }
+        }
       }
 
       // Passes all rule checks — keep and queue for Grok exit check
@@ -482,6 +730,9 @@ async function grokSwingWakeup(
       if (!strike) return false;
       const close = new Date(m.close_time).getTime();
       if (close <= now) return false;
+      // Only current window: hourly ≤ 90 min, 15-min ≤ 16 min
+      const maxClose = windowType === 'hourly' ? now + 90 * 60_000 : now + 16 * 60_000;
+      if (close > maxClose) return false;
 
       if (otmMode) {
         const dist = strike - btcPrice;
@@ -559,7 +810,7 @@ async function grokSwingWakeup(
       timestamp: new Date().toISOString(),
       decision: decision.action,
       reason: decision.reason.substring(0, 60),
-      context: { btcPrice, velocity, obi: 0 },
+      context: { btcPrice, velocity, obi: getOBI()?.imbalance ?? 0 },
     });
   });
 
@@ -634,14 +885,13 @@ async function grokSwingWakeup(
     orderId: ladderResult.buyOrderId,
     fills: [],
     signalName,
+    windowOpenBtcPrice: atmBtcPrice > 0 ? atmBtcPrice : btcPrice,
   };
 
   if (windowType === 'hourly') {
     botState.hourlyPosition = position;
-    botState.tradedThisHourlyWindow = true;
   } else {
     botState.fifteenMinPosition = position;
-    botState.tradedThisWindow = true;
   }
 
   const allPositions = readBotPositions();
@@ -668,6 +918,49 @@ async function grokSwingWakeup(
     `${decision.ticker} | ${entryPriceCents}¢ × ${contracts} = $${position.totalCost.toFixed(2)} | ` +
     `Saved: ${saving >= 0 ? saving : 0}¢/contract vs ask | Order: ${ladderResult.buyOrderId ?? 'n/a'}`
   );
+}
+
+// ── Last-minute straddle snipe ─────────────────────────────────────────────────
+
+async function runStraddleSnipe(
+  btcPrice: number,
+  markets: StrikeMarketEntry[],
+  config: ReturnType<typeof readBotConfig>['arb'],
+): Promise<void> {
+  if (!botState) return;
+
+  // Find the ATM contract (closest strike to current BTC price)
+  const atm = markets.reduce((best, m) =>
+    Math.abs(m.strike - btcPrice) < Math.abs(best.strike - btcPrice) ? m : best
+  );
+
+  // Sizing: baseline contracts; scale up proportional to bankroll if above threshold
+  let contracts = config.sniperContracts ?? 100;
+  try {
+    const bal = await getKalshiClient().getBalance();
+    const bankroll = (bal.balance + bal.payout) / 100;
+    if (bankroll >= (config.sniperBankrollThreshold ?? 300)) {
+      const scaledContracts = Math.floor(bankroll * (config.sniperBankrollPct ?? 0.01) / 0.01);
+      contracts = Math.max(contracts, scaledContracts);
+    }
+  } catch { /* use baseline */ }
+
+  try {
+    // Place resting GTC limit buys at 1¢ on BOTH sides
+    const yesOrder = await placeOrder('arb-snipe', atm.market.ticker, 'yes', 'buy', contracts, 1);
+    const noOrder  = await placeOrder('arb-snipe', atm.market.ticker, 'no',  'buy', contracts, 1);
+
+    botState.snipeOrderYesId = yesOrder.order.order_id;
+    botState.snipeOrderNoId  = noOrder.order.order_id;
+    botState.snipeTicker     = atm.market.ticker;
+
+    console.log(
+      `[SWING-SNIPE] 1¢ straddle placed on ${atm.market.ticker} × ${contracts} contracts` +
+      ` | BTC $${btcPrice.toFixed(0)} vs strike $${atm.strike}`
+    );
+  } catch (err) {
+    console.error('[SWING-SNIPE] Failed to place straddle:', err instanceof Error ? err.message : err);
+  }
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────────
@@ -708,16 +1001,20 @@ async function swingBotLoop(): Promise<void> {
     const windowKey = get15MinWindowKey();
     if (windowKey !== botState.currentWindowKey) {
       botState.currentWindowKey = windowKey;
-      botState.tradedThisWindow = false;
       botState.windowOpenBtcPrice = btcPrice;
+      // Clear straddle snipe state — GTC orders expire naturally with the old window
+      botState.snipeOrderYesId = null;
+      botState.snipeOrderNoId = null;
+      botState.snipeTicker = '';
       console.log(`[SWING] New 15-min window: ${windowKey} | BTC open: $${btcPrice.toFixed(0)}`);
     }
 
     const hourlyKey = getHourlyWindowKey();
     if (hourlyKey !== botState.currentHourlyWindowKey) {
       botState.currentHourlyWindowKey = hourlyKey;
-      botState.tradedThisHourlyWindow = false;
       botState.hourlyWindowOpenBtcPrice = btcPrice;
+      botState.spreadCompletedForHourly = false;  // new window — reset spread completion flag
+      botState.obiSniperCountThisHour = 0;         // reset per-hour OBI sniper budget
       console.log(`[SWING] New hourly window: ${hourlyKey} | BTC open: $${btcPrice.toFixed(0)}`);
     }
 
@@ -726,19 +1023,6 @@ async function swingBotLoop(): Promise<void> {
     const diskPositions = readBotPositions();
     botState.fifteenMinPosition = (diskPositions['arb'] as BotPosition) || null;
     botState.hourlyPosition = (diskPositions['arb-hourly'] as BotPosition) || null;
-
-    // Restore tradedThisWindow if a position exists from this window (handles restarts)
-    if (botState.fifteenMinPosition && !botState.tradedThisWindow) {
-      const posTime = new Date(botState.fifteenMinPosition.entryTime);
-      const posWindowMinutes = Math.floor(posTime.getMinutes() / 15) * 15;
-      const posWindowKey = `${posTime.toISOString().split('T')[0]}-${posTime.getUTCHours()}-${posWindowMinutes}`;
-      if (posWindowKey === windowKey) botState.tradedThisWindow = true;
-    }
-    if (botState.hourlyPosition && !botState.tradedThisHourlyWindow) {
-      const posTime = new Date(botState.hourlyPosition.entryTime);
-      const posHourKey = `${posTime.toISOString().split('T')[0]}-${posTime.getUTCHours()}`;
-      if (posHourKey === hourlyKey) botState.tradedThisHourlyWindow = true;
-    }
 
     // ── Handle active positions ──────────────────────────────────────────────
 
@@ -750,56 +1034,262 @@ async function swingBotLoop(): Promise<void> {
 
     const velocity = getVelocity();
 
-    const velocityOk = Math.abs(velocity) >= arbConfig.velocityThresholdPerMin;
-    const now = new Date();
-    const minute15In = now.getMinutes() % 15;
-    const minuteInHour = now.getMinutes();
+    const nowDate = new Date();
+    const nowMs = Date.now();
+    const hourUtc = nowDate.getUTCHours();
+    const isOvernight = (arbConfig.overnightEnabled ?? true) &&
+      hourUtc >= (arbConfig.overnightStartHour ?? 0) &&
+      hourUtc < (arbConfig.overnightEndHour ?? 7);
+    const effectiveVelocityThreshold = arbConfig.velocityThresholdPerMin *
+      (isOvernight ? (arbConfig.overnightVelocityMultiplier ?? 2.0) : 1.0);
+    const effectiveObiThreshold = (arbConfig.obiSniperThreshold ?? 68) *
+      (isOvernight ? (arbConfig.overnightObiMultiplier ?? 1.1) : 1.0);
+    const velocityOk = Math.abs(velocity) >= effectiveVelocityThreshold;
+    const minute15In = nowDate.getMinutes() % 15;
+    const minuteInHour = nowDate.getMinutes();
 
-    // 15-min signal check
+    // Refresh market snapshot (cached 30s) — used for mispricing check
+    await maybeRefreshMarketsSnapshot(btcPrice);
+
+    // ── Mispricing edge helper ─────────────────────────────────────────────
+
+    const computeBestEdge = (markets: StrikeMarketEntry[], sigma: number, minsRemaining: number): number => {
+      if (markets.length === 0) return 0;
+      return markets.reduce((best, { market, strike }) => {
+        const fair = estimateFairYes(btcPrice, strike, sigma, minsRemaining) * 100;
+        const yesEdge = fair - market.yes_ask;        // positive = YES is cheap
+        const noEdge = (100 - fair) - market.no_ask;  // positive = NO is cheap
+        return Math.max(best, yesEdge, noEdge);
+      }, 0);
+    };
+
+    const minsRemaining15 = 15 - minute15In;
+
+    const timeWindowOk15 = minute15In >= arbConfig.minEntryMinute && minute15In <= arbConfig.maxEntryMinute15;
+    const timeWindowOkHourly = minuteInHour >= arbConfig.minEntryMinute && minuteInHour <= 45;
+
+    // NOTE: cooldown checks use botState fields directly (not precomputed consts) so that
+    // a wakeup fired earlier in this tick blocks subsequent paths in the same tick.
+
+    // ── 15-min signal check ───────────────────────────────────────────────
+
+    const atmProximityOk15 = Math.abs(btcPrice - botState.windowOpenBtcPrice) <= arbConfig.atmProximityDollars;
+
+    // Velocity path (90s cooldown)
     if (
       velocityOk &&
-      !botState.tradedThisWindow &&
       !botState.fifteenMinPosition &&
-      Math.abs(btcPrice - botState.windowOpenBtcPrice) <= arbConfig.atmProximityDollars &&
-      minute15In >= arbConfig.minEntryMinute &&
-      minute15In <= arbConfig.maxEntryMinute15 &&
-      Date.now() - botState.lastSignalWakeupTime >= SIGNAL_WAKEUP_COOLDOWN_MS
+      atmProximityOk15 &&
+      timeWindowOk15 &&
+      nowMs - botState.lastVelocityWakeupTime >= VELOCITY_WAKEUP_COOLDOWN_MS
     ) {
-      botState.lastSignalWakeupTime = Date.now();
+      botState.lastVelocityWakeupTime = nowMs;
       botState.lastSignalDetail = `15m vel=${velocity.toFixed(0)}$/min ATM@${botState.windowOpenBtcPrice.toFixed(0)}`;
       await grokSwingWakeup('15min', btcPrice, velocity, botState.windowOpenBtcPrice, arbConfig);
     }
+    // Mispricing path (45s cooldown, independent of velocity path)
+    else if (
+      (arbConfig.mispricingEnabled ?? true) &&
+      !botState.fifteenMinPosition &&
+      timeWindowOk15 &&
+      nowMs - botState.lastMispricingWakeupTime >= MISPRICING_WAKEUP_COOLDOWN_MS
+    ) {
+      const bestEdge15 = computeBestEdge(marketsSnapshot.fifteenMin, SIGMA_15, minsRemaining15);
+      if (bestEdge15 >= (arbConfig.mispricingEdgeCents ?? 8)) {
+        botState.lastMispricingWakeupTime = nowMs;
+        botState.lastSignalDetail = `15m mispricing edge=${bestEdge15.toFixed(1)}¢ BTC@${btcPrice.toFixed(0)}`;
+        await grokSwingWakeup('15min', btcPrice, velocity, botState.windowOpenBtcPrice, arbConfig);
+      }
+    }
 
-    // Hourly signal check (re-check cooldown in case 15m just fired)
+    // ── Hourly signal check ───────────────────────────────────────────────
+
+    const atmProximityOkHourly = Math.abs(btcPrice - botState.hourlyWindowOpenBtcPrice) <= arbConfig.atmProximityDollars;
+    const minsRemainingHourly = 60 - minuteInHour;
+
+    // Velocity path (90s cooldown)
     if (
       velocityOk &&
-      !botState.tradedThisHourlyWindow &&
       !botState.hourlyPosition &&
-      Math.abs(btcPrice - botState.hourlyWindowOpenBtcPrice) <= arbConfig.atmProximityDollars &&
-      minuteInHour >= arbConfig.minEntryMinute &&
-      minuteInHour <= 45 &&
-      Date.now() - botState.lastSignalWakeupTime >= SIGNAL_WAKEUP_COOLDOWN_MS
+      atmProximityOkHourly &&
+      timeWindowOkHourly &&
+      nowMs - botState.lastVelocityWakeupTime >= VELOCITY_WAKEUP_COOLDOWN_MS
     ) {
-      botState.lastSignalWakeupTime = Date.now();
+      botState.lastVelocityWakeupTime = nowMs;
       botState.lastSignalDetail = `1h vel=${velocity.toFixed(0)}$/min ATM@${botState.hourlyWindowOpenBtcPrice.toFixed(0)}`;
       await grokSwingWakeup('hourly', btcPrice, velocity, botState.hourlyWindowOpenBtcPrice, arbConfig);
     }
+    // Mispricing path (45s cooldown, independent)
+    else if (
+      (arbConfig.mispricingEnabled ?? true) &&
+      !botState.hourlyPosition &&
+      timeWindowOkHourly &&
+      nowMs - botState.lastMispricingWakeupTime >= MISPRICING_WAKEUP_COOLDOWN_MS
+    ) {
+      const bestEdgeHourly = computeBestEdge(marketsSnapshot.hourly, SIGMA_HOURLY, minsRemainingHourly);
+      if (bestEdgeHourly >= (arbConfig.mispricingEdgeCents ?? 8)) {
+        botState.lastMispricingWakeupTime = nowMs;
+        botState.lastSignalDetail = `1h mispricing edge=${bestEdgeHourly.toFixed(1)}¢ BTC@${btcPrice.toFixed(0)}`;
+        await grokSwingWakeup('hourly', btcPrice, velocity, botState.hourlyWindowOpenBtcPrice, arbConfig);
+      }
+    }
 
-    // OTM spike hunter: fires during high-velocity moves regardless of ATM proximity
+    // ── OTM spike hunter ─────────────────────────────────────────────────
+    // Fires during high-velocity moves regardless of ATM proximity.
     // Looks for cheap contracts ($800–$1250 OTM in spike direction, ask ≤ maxOtmAskCents)
-    const spikeVelOk = Math.abs(velocity) >= arbConfig.velocityThresholdPerMin * (arbConfig.spikeVelocityMultiplier ?? 2.0);
+
+    const spikeVelOk = Math.abs(velocity) >= effectiveVelocityThreshold * (arbConfig.spikeVelocityMultiplier ?? 2.0);
     if (
       spikeVelOk &&
-      !botState.tradedThisHourlyWindow &&
       !botState.hourlyPosition &&
       minuteInHour >= arbConfig.minEntryMinute &&
       minuteInHour <= 50 &&
-      Date.now() - botState.lastSignalWakeupTime >= SIGNAL_WAKEUP_COOLDOWN_MS
+      nowMs - botState.lastVelocityWakeupTime >= VELOCITY_WAKEUP_COOLDOWN_MS
     ) {
-      botState.lastSignalWakeupTime = Date.now();
+      botState.lastVelocityWakeupTime = nowMs;
       const hourlyDrift = btcPrice - botState.hourlyWindowOpenBtcPrice;
       botState.lastSignalDetail = `1h OTM spike vel=${velocity.toFixed(0)}$/min drift=${hourlyDrift >= 0 ? '+' : ''}$${hourlyDrift.toFixed(0)}`;
       await grokSwingWakeup('hourly', btcPrice, velocity, botState.hourlyWindowOpenBtcPrice, arbConfig, true);
+    }
+
+    // ── OBI sniper: order-book-triggered directional OTM entry ───────────────
+    // When BTC order book loads heavily in one direction, buy cheap OTM contracts
+    // in that direction before Kalshi prices catch up (2-5s lag). No Grok needed.
+    // Hourly only — more time for the anticipated move to play out.
+
+    if (
+      (arbConfig.obiSniperEnabled ?? true) &&
+      !botState.hourlyPosition &&
+      botState.obiSniperCountThisHour < (arbConfig.obiSniperMaxPerHour ?? 2) &&
+      minuteInHour >= arbConfig.minEntryMinute &&
+      minuteInHour <= 50 &&
+      marketsSnapshot.hourly.length >= 2 &&
+      nowMs - lastObiSniperTime > OBI_SNIPER_COOLDOWN_MS
+    ) {
+      const obi = getOBI();
+      if (obi !== null) {
+        const obiThreshold = effectiveObiThreshold;
+        const obiDelta = getOBIDelta();
+        // bid-heavy + not collapsing → YES (BTC going up)
+        // ask-heavy + not recovering → NO (BTC going down)
+        const sniperSide: 'yes' | 'no' | null =
+          obi.bidPct >= obiThreshold && obiDelta !== 'falling' ? 'yes' :
+          obi.askPct >= obiThreshold && obiDelta !== 'rising'  ? 'no'  : null;
+
+        if (sniperSide) {
+          const obiMaxAsk  = arbConfig.obiMaxAskCents    ?? 3;
+          const obiMinOtm  = arbConfig.obiMinOtmDollars  ?? 300;
+          const obiMaxOtm  = arbConfig.obiMaxOtmDollars  ?? 2000;
+          const obiCapital = arbConfig.obiCapitalPerTrade ?? arbConfig.capitalPerTrade;
+
+          // Find cheapest candidate closest to ATM within OTM range
+          const candidates = marketsSnapshot.hourly
+            .filter(({ market, strike }) => {
+              const dist = sniperSide === 'yes' ? strike - btcPrice : btcPrice - strike;
+              if (dist < obiMinOtm || dist > obiMaxOtm) return false;
+              const ask = sniperSide === 'yes' ? market.yes_ask : market.no_ask;
+              return ask > 0 && ask <= obiMaxAsk;
+            })
+            .sort((a, b) => {
+              const da = sniperSide === 'yes' ? a.strike - btcPrice : btcPrice - a.strike;
+              const db = sniperSide === 'yes' ? b.strike - btcPrice : btcPrice - b.strike;
+              return da - db; // closest to ATM first
+            });
+
+          if (candidates.length > 0) {
+            const best = candidates[0];
+            const askCents = sniperSide === 'yes' ? best.market.yes_ask! : best.market.no_ask!;
+            const contracts = Math.max(1, Math.floor(obiCapital / (askCents / 100)));
+            lastObiSniperTime = nowMs;
+            botState.obiSniperCountThisHour++;
+
+            console.log(
+              `[SWING] OBI SNIPER | ${sniperSide.toUpperCase()} ${best.market.ticker} @ ${askCents}¢ × ${contracts} | ` +
+              `OBI: bid${obi.bidPct}%/ask${obi.askPct}% delta:${obiDelta} | BTC $${btcPrice.toFixed(0)}`
+            );
+            botState.lastSignalDetail = `OBI snipe: ${sniperSide.toUpperCase()} ${best.market.ticker} bid${obi.bidPct}% delta:${obiDelta}`;
+
+            try {
+              const result = await placeOrder('arb', best.market.ticker, sniperSide, 'buy', contracts, askCents);
+              const orderId: string | undefined = result?.order?.order_id;
+              const signalName = `OBI snipe: bid${obi.bidPct}%/ask${obi.askPct}% delta:${obiDelta}`;
+              const position: BotPosition = {
+                bot: 'arb',
+                ticker: best.market.ticker,
+                side: sniperSide,
+                contracts,
+                entryPrice: askCents / 100,
+                totalCost: contracts * (askCents / 100),
+                entryTime: new Date().toISOString(),
+                btcPriceAtEntry: btcPrice,
+                strike: best.strike,
+                orderId,
+                fills: [],
+                signalName,
+                windowOpenBtcPrice: botState.hourlyWindowOpenBtcPrice > 0 ? botState.hourlyWindowOpenBtcPrice : btcPrice,
+              };
+              botState.hourlyPosition = position;
+              const allPositions = readBotPositions();
+              allPositions['arb-hourly'] = position;
+              writeBotPositions(allPositions);
+
+              if (orderId) {
+                openTradeLifecycle({
+                  tradeId: orderId,
+                  bot: 'arb',
+                  ticker: best.market.ticker,
+                  side: sniperSide,
+                  contracts,
+                  entryPrice: askCents / 100,
+                  entryTime: position.entryTime,
+                  entryBtcPrice: btcPrice,
+                  signal: signalName,
+                });
+              }
+            } catch (err) {
+              console.error('[SWING] OBI sniper order failed:', err instanceof Error ? err.message : err);
+            }
+          }
+        }
+      }
+    }
+
+    // ── Spread arb Path C: simultaneous entry on pricing violation ───────────
+    // Hourly markets only. Fires when YES[lower_strike] + NO[upper_strike] < $1 net of fees.
+    // True arb — no directional judgment needed. 30s cooldown between attempts.
+
+    if (
+      (arbConfig.spreadArbEnabled ?? true) &&
+      !botState.hourlyPosition &&
+      marketsSnapshot.hourly.length >= 2 &&
+      nowMs - lastSpreadArbTime > SPREAD_ARB_COOLDOWN_MS
+    ) {
+      const spreadViolation = findSpreadViolation(marketsSnapshot.hourly, arbConfig.spreadArbMinNetCents ?? 3);
+      if (spreadViolation) {
+        lastSpreadArbTime = nowMs;
+        await executeSimultaneousSpread(spreadViolation, arbConfig);
+      }
+    }
+
+    // ── Last-minute straddle snipe ────────────────────────────────────────
+    // In the final 1–3 minutes of a 15-min window, when BTC is ≤ $100 from the
+    // ATM strike, place resting 1¢ GTC limit buys on BOTH YES and NO.
+
+    const sniperWindow = minsRemaining15 >= 1 && minsRemaining15 <= 3;
+    const btcNearStrike = marketsSnapshot.fifteenMin.some(
+      ({ strike }) => Math.abs(btcPrice - strike) <= 100
+    );
+    const noExistingSnipe = !botState.snipeOrderYesId && !botState.snipeOrderNoId;
+    const noMainPosition = !botState.fifteenMinPosition;
+
+    if (
+      (arbConfig.sniperEnabled ?? false) &&
+      sniperWindow &&
+      btcNearStrike &&
+      noExistingSnipe &&
+      noMainPosition
+    ) {
+      await runStraddleSnipe(btcPrice, marketsSnapshot.fifteenMin, arbConfig);
     }
 
   } catch (err) {
@@ -824,17 +1314,24 @@ export function startGrokSwingBot(): void {
     running: true,
 
     fifteenMinPosition: null,
-    tradedThisWindow: false,
     currentWindowKey: get15MinWindowKey(),
     windowOpenBtcPrice: btcPrice > 0 ? btcPrice : 0,
 
     hourlyPosition: null,
-    tradedThisHourlyWindow: false,
     currentHourlyWindowKey: getHourlyWindowKey(),
     hourlyWindowOpenBtcPrice: btcPrice > 0 ? btcPrice : 0,
 
-    lastSignalWakeupTime: 0,
+    obiSniperCountThisHour: 0,
+
+    lastVelocityWakeupTime: 0,
+    lastMispricingWakeupTime: 0,
     lastGrokExitCheckTime: 0,
+
+    spreadCompletedForHourly: false,
+
+    snipeOrderYesId: null,
+    snipeOrderNoId: null,
+    snipeTicker: '',
 
     dailyPnL: 0,
     tradesCount: 0,
